@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <title>ServerSnap</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <div class="brand"><img src="../assets/icon.png" alt=""><span>ServerSnap</span></div>
+      <div class="side-label">Servers</div>
+      <nav id="serverList" class="server-list"></nav>
+      <button id="addServer" class="btn ghost add">+ Add server</button>
+      <div class="side-spacer"></div>
+      <nav class="side-nav">
+        <a data-page="backups">Backups</a>
+        <a data-page="activity">Activity <span id="activityBadge" class="badge hidden"></span></a>
+        <a data-page="settings">Settings</a>
+      </nav>
+    </aside>
+    <main id="main" class="main"></main>
+  </div>
+  <div id="modal" class="modal hidden"><div class="modal-card" id="modalCard"></div></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="common.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <title>ServerSnap Client</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <div class="brand"><img src="../assets/icon.png" alt=""><span>ServerSnap <small class="muted">Client</small></span></div>
+      <div class="side-label">My websites</div>
+      <nav id="siteList" class="server-list"></nav>
+      <button id="addSite" class="btn ghost add">+ Add access code</button>
+      <div class="side-spacer"></div>
+      <nav class="side-nav">
+        <a data-page="settings">Settings</a>
+      </nav>
+    </aside>
+    <main id="main" class="main"></main>
+  </div>
+  <div id="modal" class="modal hidden"><div class="modal-card" id="modalCard"></div></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="common.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>
