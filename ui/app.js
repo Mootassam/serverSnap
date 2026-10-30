@@ -364,7 +364,7 @@ function groupPanel(g) {
       h('div', { class: 'chips' }, g.summary.length ? g.summary.map((x) => h('span', { class: `chip ${x.role}` }, x.label, x.sizeKb != null && x.role !== 'cache' ? h('i', {}, fmtKb(x.sizeKb)) : null)) : h('span', { class: 'muted small' }, 'No volumes')),
       busy ? h('div', { class: 'note info' }, busy) : null,
       g.name ? h('div', { class: 'row', style: 'margin-top:12px' },
-        client ? h('span', { class: 'small' }, '👤 Customer access: ', h('b', {}, client.name), h('span', { class: 'muted' }, ` · daily at ${client.time}`)) : h('span', { class: 'muted small' }, 'No customer access yet.'),
+        client ? h('span', { class: 'small' }, '👤 Customer access: ', h('b', {}, client.name), h('span', { class: 'muted' }, ` · ${client.scheduleText || `every day at ${client.time}`}`)) : h('span', { class: 'muted small' }, 'No customer access yet.'),
         h('button', { class: 'btn small', onclick: () => clientModal(s, g.name) }, client ? 'Change customer access' : 'Give this customer a download app')) : null),
     h('div', { class: 'card' }, h('div', { class: 'row', style: 'margin-bottom:6px' }, h('h2', { style: 'margin:0;flex:1' }, `Containers (${g.containers.length})`),
       picked.length ? h('button', { class: 'btn small danger-fill', disabled: !!busy, onclick: () => deleteContainersModal(g, picked, false) }, `Delete selected (${picked.length})`) : null),
@@ -575,7 +575,7 @@ function clientCard(s, c) {
   const card = h('div', { class: 'card' },
     h('div', { class: 'row' },
       h('div', { style: 'flex:1;min-width:220px' }, h('h2', { style: 'margin:0' }, c.name, h('span', { class: 'pill' }, c.project)),
-        h('div', { class: 'muted small' }, `Login ${c.user} · every day at ${c.time} (server time) · keeps ${c.keep}`)),
+        h('div', { class: 'muted small' }, `Login ${c.user} · ${c.scheduleText || `every day at ${c.time}`} (server time) · keeps ${c.keep}`)),
       h('button', { class: 'btn small primary', onclick: () => safe(() => api.call('clients:copyCode', s.id, c.id), 'Access code copied. Paste it to your customer (WhatsApp, Telegram, email).') }, 'Copy access code'),
       h('button', { class: 'btn small', onclick: () => safe(async () => { const p = await api.call('clients:saveCode', s.id, c.id); if (p) toast(`Saved ${p}`); }) }, 'Save as file'),
       h('button', { class: 'btn small', onclick: async () => { const j = await safe(() => api.call('clients:run', s.id, c.id)); if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); } } }, 'Back up now'),
@@ -620,7 +620,19 @@ async function clientModal(s, project) {
   const pick = h('select', {}, ...named.map((g) => h('option', { value: g.name, selected: g.name === project }, `${g.title} — ${summaryText(g)}`)));
   const name = h('input', { type: 'text', placeholder: 'Customer or website name' });
   const time = h('input', { type: 'time', value: '03:30' });
-  const keep = h('input', { type: 'number', min: 1, max: 90, value: 7, style: 'width:90px' });
+  const every = h('select', {}, ...[['hourly', 'Every hour'], ['every6h', 'Every 6 hours'], ['every12h', 'Every 12 hours'], ['daily', 'Every day']]
+    .map(([v, l]) => h('option', { value: v, selected: v === 'daily' }, l)));
+  const keep = h('input', { type: 'number', min: 1, max: 500, value: 7, style: 'width:90px' });
+  const timeLabel = h('span', {}, 'At (server clock)');
+  const keepHint = h('span', { class: 'muted' }, 'backups');
+  const syncEvery = (changed) => {
+    const hourly = every.value === 'hourly';
+    timeLabel.textContent = hourly ? 'At minute (server clock; only the minute is used)' : every.value === 'daily' ? 'At (server clock)' : 'Starting at (server clock)';
+    // a sensible history: one day of hourly backups, one week of daily ones
+    if (changed) keep.value = { hourly: 24, every6h: 28, every12h: 14, daily: 7 }[every.value];
+    keepHint.textContent = `backups (${{ hourly: 'hours', every6h: '× 6 hours', every12h: '× 12 hours', daily: 'days' }[every.value]})`;
+  };
+  every.addEventListener('change', () => syncEvery(true));
   const itemsBox = h('div', {});
   const err = h('div', { class: 'note bad hidden' });
   const saveBtn = h('button', { class: 'btn primary', disabled: true }, 'Save & set up');
@@ -630,7 +642,9 @@ async function clientModal(s, project) {
     fill(itemsBox, h('div', { class: 'muted small' }, 'Measuring…'));
     choices = await safe(() => api.call('clients:choices', s.id, pick.value));
     if (!choices) { fill(itemsBox, h('div', { class: 'note bad' }, 'Could not read this project.')); return; }
-    if (choices.existing) { name.value = choices.existing.name; time.value = choices.existing.time; keep.value = choices.existing.keep; } else if (!name.value || named.some((g) => g.name === name.value)) name.value = pick.value;
+    if (choices.existing) { name.value = choices.existing.name; time.value = choices.existing.time; every.value = choices.existing.every; keep.value = choices.existing.keep; }
+    else if (!name.value || named.some((g) => g.name === name.value)) name.value = pick.value;
+    syncEvery(false);
     saveBtn.textContent = choices.existing ? 'Save changes' : 'Save & set up';
     fill(itemsBox, choices.items.length ? choices.items.map((i) => {
       const cb = h('input', { type: 'checkbox', checked: i.on, onchange: (e) => { i.on = e.target.checked; } });
@@ -645,7 +659,7 @@ async function clientModal(s, project) {
     const items = (choices ? choices.items : []).filter((i) => i.on);
     if (!items.length) { err.textContent = 'Tick at least one thing the customer can download.'; err.classList.remove('hidden'); return; }
     saveBtn.disabled = true;
-    const j = await safe(() => api.call('clients:save', s.id, { project: pick.value, name: name.value, items, time: time.value, keep: Number(keep.value) }));
+    const j = await safe(() => api.call('clients:save', s.id, { project: pick.value, name: name.value, items, time: time.value, every: every.value, keep: Number(keep.value) }));
     if (!j) { saveBtn.disabled = false; return; }
     closeModal();
     state.jobs.set(j.id, j);
@@ -655,9 +669,10 @@ async function clientModal(s, project) {
   fill(body,
     h('div', { class: 'grid2' }, h('label', { class: 'field' }, 'Docker project (website)', pick), h('label', { class: 'field' }, 'Customer name (shown in their app)', name)),
     h('div', { class: 'card', style: 'margin-top:14px' }, h('h2', {}, 'What the customer can download'), itemsBox),
-    h('div', { class: 'grid2' }, h('label', { class: 'field' }, 'Daily backup time (server clock)', time),
-      h('label', { class: 'field' }, 'Keep on the server', h('div', { class: 'row' }, keep, h('span', { class: 'muted' }, 'days')))),
-    h('div', { class: 'note info' }, 'The server makes this copy itself every day, even when your PC is off. The customer gets a locked login that can only read this copy: no shell, no code, no other websites.'),
+    h('div', { class: 'grid2' }, h('label', { class: 'field' }, 'How often', every), h('label', { class: 'field' }, timeLabel, time),
+      h('label', { class: 'field' }, 'Keep on the server', h('div', { class: 'row' }, keep, keepHint))),
+    h('div', { class: 'note info' }, 'The server makes this copy itself on this schedule, even when your PC is off. The customer gets a locked login that can only read this copy: no shell, no code, no other websites. ' +
+      'From their app they can also press "Make a backup now" (at most once every 10 minutes).'),
     err,
     h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: closeModal }, 'Cancel'), saveBtn));
   load();

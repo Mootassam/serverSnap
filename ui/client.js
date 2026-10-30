@@ -74,9 +74,11 @@ function renderSite(main, id) {
   const b = state.backups.get(id);
   if (!b) { loadBackups(id); }
   const job = runningJob(id);
+  const making = job && job.kind === 'backup-now' ? job : null;
   const list = (b && b.list) || [];
-  const rows = list.map((x) => {
-    const mine = job && job.name === x.name;
+  // The customer only gets the newest backup.
+  const rows = list.slice(0, 1).map((x) => {
+    const mine = job && !making && job.name === x.name;
     let action;
     if (mine) {
       const pct = job.total ? Math.min(100, (job.bytes / job.total) * 100) : 0;
@@ -100,20 +102,44 @@ function renderSite(main, id) {
       h('div', { class: 'grow' }, h('h1', {}, s.name), h('div', { class: 'meta' }, `Website "${s.project}"`,
         s.lastCheck ? h('span', { class: 'pill' }, `checked ${ago(s.lastCheck)}`) : null)),
       h('button', { class: 'btn', disabled: b && b.loading, onclick: () => loadBackups(id) }, b && b.loading ? 'Checking…' : 'Check for new backups'),
-      h('button', { class: 'btn', onclick: () => api.call('access:openFolder', id) }, 'Open my backups folder')),
+      h('button', { class: 'btn', onclick: () => api.call('access:openFolder', id) }, 'Open my backups folder'),
+      h('button', { class: 'btn primary', disabled: !!job, onclick: () => backupNow(id, list) }, making ? 'Making a backup…' : 'Make a backup now')),
     b && b.error ? h('div', { class: 'note bad' }, b.error) : null,
+    making ? h('div', { class: 'card' },
+      h('div', { class: 'row' }, h('h2', { style: 'margin:0;flex:1' }, 'Making a fresh backup'),
+        h('button', { class: 'btn small', onclick: () => api.call('jobs:stop', making.id) }, 'Stop waiting')),
+      h('div', { class: 'muted', style: 'margin-top:6px' }, {
+        asking: 'Asking the server…',
+        waiting: 'Waiting for the server to start (it checks every minute)…',
+        making: 'The server is copying your database and files. This can take a few minutes…',
+      }[making.phase] || 'Working…'),
+      h('div', { class: 'bar indeterminate' }, h('i')),
+      h('div', { class: 'muted small', style: 'margin-top:6px' }, 'When it is ready it downloads to this PC by itself.')) : null,
     h('div', { class: 'card' },
-      h('h2', {}, 'Backups ready on the server'),
+      h('h2', {}, 'Your latest backup'),
       !b || (b.loading && !b.list) ? h('div', {}, h('div', { class: 'muted' }, 'Connecting…'), h('div', { class: 'bar indeterminate' }, h('i'))) :
         rows.length ? h('table', {}, h('thead', {}, h('tr', {}, ...['Date', 'Status', 'Size', 'Contains', ''].map((t) => h('th', {}, t)))), h('tbody', {}, rows)) :
-          h('div', { class: 'muted' }, 'No backup is ready yet. The server makes one every day.')),
-    job && !list.some((x) => x.name === job.name) ? h('div', { class: 'note info' }, `Downloading ${job.title}…`) : null,
+          h('div', { class: 'muted' }, 'No backup is ready yet. Press "Make a backup now", or wait for the next automatic one.')),
+    job && !making && !list.slice(0, 1).some((x) => x.name === job.name) ? h('div', { class: 'note info' }, `Downloading ${job.title}…`) : null,
     h('div', { class: 'card' }, h('h2', {}, 'Good to know'),
       h('div', { class: 'small muted' }, 'Files are saved in ', h('span', { class: 'mono' }, s.folder), '. Each backup has a ', h('span', { class: 'mono' }, 'databases'), ' folder (database copy) and ',
         h('span', { class: 'mono' }, 'volumes'), ' / ', h('span', { class: 'mono' }, 'files'), ' (your uploads as .tar.gz, open them with 7-Zip or WinRAR). Every file is checked after download, so a damaged download is never kept.'),
       h('div', { class: 'row', style: 'margin-top:12px' },
         h('button', { class: 'btn small ghost', onclick: () => renameModal(s) }, 'Rename'),
         h('button', { class: 'btn small danger', onclick: () => removeSite(s) }, 'Remove this website'))));
+}
+
+async function backupNow(id, list) {
+  const newest = list[0];
+  const age = newest && newest.createdAt ? (Date.now() - new Date(newest.createdAt)) / 60000 : Infinity;
+  if (age < 10) {
+    if (!(await confirmBox('You already have a fresh backup', `The newest backup is only ${Math.max(1, Math.round(age))} minute(s) old. The server makes at most one extra backup every 10 minutes. Download that one instead?`, 'Download it'))) return;
+    if (!newest.local) startDownload(id, newest.name);
+    else api.call('backups:open', newest.local);
+    return;
+  }
+  const j = await safe(() => api.call('access:backupNow', id));
+  if (j) { state.jobs.set(j.id, j); render(); }
 }
 
 async function startDownload(id, name) {
@@ -200,7 +226,8 @@ let drawTimer = null;
 api.onJob((j) => {
   state.jobs.set(j.id, j);
   if (j.state !== 'running') {
-    if (j.state === 'done') toast(`${j.title}: downloaded`);
+    if (j.state === 'done' && j.kind === 'backup-now') toast('Your new backup is ready. Downloading it now…');
+    else if (j.state === 'done') toast(`${j.title}: downloaded`);
     else toast(`${j.title}: ${j.error || j.state}`, j.state === 'failed');
     loadSites().then(() => loadBackups(j.accessId));
     return;

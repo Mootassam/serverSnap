@@ -98,7 +98,7 @@ async function connect(a) {
   return r;
 }
 
-function isBackupName(n) { return /^\d{4}-\d{2}-\d{2}_[\d-]+$/.test(n); }
+const { isBackupName } = sftpUtil;
 
 function localState(a, name) {
   const dir = path.join(accessDir(a), name);
@@ -214,6 +214,40 @@ function downloadJob(accessId, name, { auto = false } = {}) {
   return publicJob(job);
 }
 
+// "Make a backup now": ask the server, wait for the new backup, then download it.
+function backupNowJob(accessId) {
+  const a = getAccess(accessId);
+  if ([...jobs.values()].some((j) => j.accessId === a.id && j.state === 'running')) throw new Error('Something is already running for this website.');
+  const job = newJob(a, `${a.name}: new backup`);
+  job.kind = 'backup-now';
+  job.phase = 'asking';
+  (async () => {
+    let r = null;
+    let name = null;
+    try {
+      r = await connect(a);
+      const sftp = await r.sftp();
+      name = await sftpUtil.requestBackup(sftp, { signal: job.controller.signal, onState: (p) => { job.phase = p; emit(job); } });
+      log(`backup now for ${a.name}: ${name}`);
+      job.state = 'done';
+      job.name = name;
+    } catch (err) {
+      log(err);
+      job.state = err.code === 'ABORTED' ? 'stopped' : 'failed';
+      job.error = err.message;
+    } finally {
+      if (r) r.close();
+      job.finishedAt = Date.now();
+      try { powerSaveBlocker.stop(job.blocker); } catch (_) { /* already stopped */ }
+      emit(job);
+    }
+    if (name) {
+      try { downloadJob(a.id, name); } catch (err) { log(err); }
+    }
+  })();
+  return publicJob(job);
+}
+
 // Automatic: download the newest backup of every website if it is not on this PC yet.
 let ticking = false;
 async function tick() {
@@ -260,6 +294,7 @@ function registerIpc() {
   handle('access:remove', (id) => { data.accesses = data.accesses.filter((x) => x.id !== id); save(); return true; });
   handle('access:backups', async (id) => listRemote(getAccess(id)));
   handle('access:download', (id, name) => downloadJob(id, name));
+  handle('access:backupNow', (id) => backupNowJob(id));
   handle('access:openFolder', async (id) => {
     const dir = accessDir(getAccess(id));
     await fs.promises.mkdir(dir, { recursive: true });

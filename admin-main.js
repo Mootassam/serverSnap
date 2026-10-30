@@ -315,7 +315,7 @@ async function clientChoices(serverId, project) {
   const existing = clientList(serverId).find((x) => x.project === project);
   const items = clients.itemChoices(g);
   if (existing) for (const i of items) i.on = existing.items.some((e) => e.key === i.key);
-  return { project, items, existing: existing ? { id: existing.id, name: existing.name, time: existing.time, keep: existing.keep } : null };
+  return { project, items, existing: existing ? { id: existing.id, name: existing.name, time: existing.time, every: existing.every || 'daily', keep: existing.keep } : null };
 }
 
 // Logs in as the customer (key only, read-only folder) to prove the access really works.
@@ -328,6 +328,15 @@ async function testClientLogin(server, user, privateKey) {
     let escaped = false;
     try { await sftpUtil.readdir(sftp, '/etc'); escaped = true; } catch (_) { /* expected: nothing outside the folder */ }
     if (escaped) throw new Error('The customer login can see outside its own folder. Access was not given.');
+    // It must not be able to write anywhere except requests/ (the "Make a backup now" note).
+    for (const p of ['/backups/.serversnap-write-test', '/.serversnap-write-test']) {
+      let wrote = false;
+      try { await sftpUtil.writeFile(sftp, p, 'x'); wrote = true; } catch (_) { /* expected: read-only */ }
+      if (wrote) {
+        await new Promise((res) => sftp.unlink(p, () => res()));
+        throw new Error(`The customer login could write to ${p.replace(/\/[^/]*$/, '') || '/'}. Access was not given.`);
+      }
+    }
   } finally { r.close(); }
 }
 
@@ -357,7 +366,9 @@ function clientJob(serverId, input) {
       const record = {
         id: old ? old.id : crypto.randomUUID(), project, user, name: String(input.name || project).trim() || project,
         items: items.map((i) => ({ key: i.key, type: i.type, kind: i.kind, container: i.container, service: i.service, name: i.name, path: i.path, label: i.label })),
-        keep: Math.max(1, Math.min(90, Number(input.keep) || 7)), time: /^\d{1,2}:\d{2}$/.test(input.time || '') ? input.time : '03:30',
+        keep: Math.max(1, Math.min(500, Number(input.keep) || 7)), time: /^\d{1,2}:\d{2}$/.test(input.time || '') ? input.time : '03:30',
+        every: clients.CLIENT_EVERY[input.every] ? input.every : 'daily',
+        scheduleText: clients.scheduleText(input.time, clients.CLIENT_EVERY[input.every] ? input.every : 'daily'),
         keyEnc, publicKey, createdAt: old ? old.createdAt : new Date().toISOString(), updatedAt: new Date().toISOString(),
       };
 
@@ -369,10 +380,10 @@ function clientJob(serverId, input) {
 
       step('install', `Create the locked login "${user}" and the nightly job`, 'running');
       const script = clients.exportScript({ project, user, server, items: record.items, keep: record.keep });
-      const out = await remote.run(clients.installScript({ user, publicKey, script, cron: clients.cronFile(user, record.time) }), { root: true, timeoutMs: 120000 });
+      const out = await remote.run(clients.installScript({ user, publicKey, script, cron: clients.cronFile(user, record.time, record.every) }), { root: true, timeoutMs: 120000 });
       const sshdChanged = out.includes('SSHD-CHANGED');
       step('install', `Create the locked login "${user}" and the nightly job`, 'ok');
-      say(`Login ${user} is ready. It can only read ${clients.BASE}/${user}/backups. Daily backup at ${record.time} (server time), keeping ${record.keep}.`);
+      say(`Login ${user} is ready. It can only read ${clients.BASE}/${user}/backups. Backup ${clients.scheduleText(record.time, record.every)} (server time), keeping the newest ${record.keep}.`);
 
       if (sshdChanged) {
         step('sshd', 'Check that you can still log in', 'running');

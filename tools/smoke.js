@@ -85,7 +85,7 @@ const steps = [
   ['9-docker-shubh', "state.docker.sel='shubh'; redrawDocker();"],
   ['10-docker-images', "state.docker.sel='#images'; redrawDocker();"],
   ['11-customers', "state.page.tab='clients'; render();"],
-  ['12-customer-modal', "clientModal(state.servers[0], 'king');"],
+  ['12-customer-modal', "clientModal(state.servers[0], 'king'); setTimeout(() => { const s = document.querySelectorAll('.modal select')[1]; s.value = 'hourly'; s.dispatchEvent(new Event('change')); }, 500);"],
   ['13-pick-containers', "closeModal(); state.page.tab='docker'; state.docker.sel='king'; render(); setTimeout(() => { const g = state.docker.data.groups[0]; state.docker.pick.containers.add(g.containers[0].id); state.docker.pick.containers.add(g.containers[3].id); redrawDocker(); }, 300);"],
   ['14-delete-customer', "const g = state.docker.data.groups[0]; deleteContainersModal(g, g.containers, true); document.querySelector('.modal input[type=checkbox]').click();"],
   ['15-images-pick', "closeModal(); state.docker.sel='#images'; for (const i of state.docker.data.images) if (!i.usedBy.length) state.docker.pick.images.add(i.id); redrawDocker();"],
@@ -110,7 +110,8 @@ fs.writeFileSync(path.join(dir, 'client-downloads', 'King_Trading', '2026-10-29_
 fs.writeFileSync(path.join(dir, 'client-steps.json'), JSON.stringify([
   ['c1-site', null],
   ['c2-add-code', `addModal(); document.querySelector('textarea').value=${JSON.stringify(code.slice(0, 90) + '…')};`],
-  ['c3-settings', "closeModal(); go({name:'settings'});"],
+  ['c3-backup-now', "closeModal(); state.jobs.set('x', { id: 'x', accessId: 'a1', state: 'running', kind: 'backup-now', phase: 'making', title: 'King Trading: new backup' }); go({name:'site', id:'a1'});"],
+  ['c4-settings', "state.jobs.clear(); go({name:'settings'});"],
 ]));
 
 const electron = require('electron');

@@ -138,6 +138,19 @@ test('customer choices: database copy and uploads ticked, raw DB files and cache
   assert.ok(items.some((i) => !i.on && /Cache/.test(i.label)));
 });
 
+test('customer schedule: hourly, every 6 / 12 hours, daily', () => {
+  assert.equal(clients.cronWhen('03:30', 'hourly'), '30 * * * *');
+  assert.equal(clients.cronWhen('03:30', 'every6h'), '30 3,9,15,21 * * *');
+  assert.equal(clients.cronWhen('14:05', 'every6h'), '5 2,8,14,20 * * *');
+  assert.equal(clients.cronWhen('03:30', 'every12h'), '30 3,15 * * *');
+  assert.equal(clients.cronWhen('03:30', 'daily'), '30 3 * * *');
+  assert.equal(clients.cronWhen('03:30', 'nonsense'), '30 3 * * *');
+  assert.equal(clients.scheduleText('03:30', 'hourly'), 'every hour, at minute 30');
+  assert.equal(clients.scheduleText('03:30', 'every12h'), 'every 12 hours at 03:30, 15:30');
+  assert.equal(clients.scheduleText('03:30', 'daily'), 'every day at 03:30');
+  assert.match(clients.cronFile('snap_king', '03:30', 'hourly'), /^30 \* \* \* \* root \/usr\/local\/sbin\/serversnap-export-snap_king >>/m);
+});
+
 test('nightly job time', () => {
   assert.match(clients.cronFile('snap_king', '03:30'), /^30 3 \* \* \* root \/usr\/local\/sbin\/serversnap-export-snap_king /m);
   assert.match(clients.cronFile('snap_king', 'bad'), /^30 3 /m);
@@ -165,7 +178,8 @@ test('sshd rule: only the customer group, read-only SFTP in its own folder, keys
   const b = clients.SSHD_BLOCK;
   assert.match(b, /Match Group serversnap-clients/);
   assert.match(b, /ChrootDirectory \/srv\/serversnap\/%u/);
-  assert.match(b, /ForceCommand internal-sftp -R/);
+  // writes are stopped by folder permissions (only requests/ is theirs), so no "-R" here
+  assert.match(b, /ForceCommand internal-sftp$/m);
   assert.match(b, /AuthenticationMethods publickey/);
   assert.match(b, /AllowTcpForwarding no/);
   assert.match(b, /# END ServerSnap\n$/);

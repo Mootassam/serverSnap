@@ -95,6 +95,57 @@ test('a cancelled or wrong code is refused with a clear message', async () => {
   await assert.rejects(r.connect(), /Wrong username, password or key/);
 });
 
+// Plays the server's part: picks up the note, shows ".running", then publishes a backup (or skips).
+function fakeServer({ make = true } = {}) {
+  const note = path.join(root, 'requests', 'now');
+  const timer = setInterval(() => {
+    if (!fs.existsSync(note)) return;
+    fs.rmSync(note);
+    if (!make) return;
+    clearInterval(timer);
+    fs.writeFileSync(path.join(root, 'backups', '.running'), '');
+    setTimeout(() => {
+      const n = '2026-10-30_15-00-00';
+      fs.mkdirSync(path.join(root, 'backups', n), { recursive: true });
+      fs.writeFileSync(path.join(root, 'backups', n, 'manifest.json'), JSON.stringify({ ...manifest, name: n }));
+      fs.rmSync(path.join(root, 'backups', '.running'));
+    }, 400);
+  }, 50);
+  return () => clearInterval(timer);
+}
+
+test('"Make a backup now": leaves a note, waits for the server, returns the new backup', async () => {
+  fs.mkdirSync(path.join(root, 'requests'), { recursive: true });
+  const stop = fakeServer();
+  const r = fromCode();
+  await r.connect();
+  try {
+    const states = [];
+    const name = await sftpUtil.requestBackup(await r.sftp(), { pollMs: 100, skipAfterMs: 1000, onState: (s) => states.push(s) });
+    assert.equal(name, '2026-10-30_15-00-00');
+    assert.equal(states[0], 'waiting');
+    assert.ok(!fs.existsSync(path.join(root, 'requests', 'now')));
+  } finally { stop(); r.close(); }
+});
+
+test('"Make a backup now" too soon: a clear message instead of waiting forever', async () => {
+  const stop = fakeServer({ make: false });
+  const r = fromCode();
+  await r.connect();
+  try {
+    await assert.rejects(sftpUtil.requestBackup(await r.sftp(), { pollMs: 100, skipAfterMs: 500 }), (e) => e.code === 'TOO_SOON');
+  } finally { stop(); r.close(); }
+});
+
+test('"Make a backup now" on an access set up before this feature: tells what to do', async () => {
+  fs.rmSync(path.join(root, 'requests'), { recursive: true, force: true });
+  const r = fromCode();
+  await r.connect();
+  try {
+    await assert.rejects(sftpUtil.requestBackup(await r.sftp(), { pollMs: 100 }), /not turned on/);
+  } finally { r.close(); }
+});
+
 test('stopping a download leaves no half file', async () => {
   const r = fromCode();
   await r.connect();

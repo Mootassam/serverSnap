@@ -117,7 +117,9 @@ function itemBlock(item, project) {
 }
 
 // The nightly job (bash, runs as root on the server).
-function exportScript({ project, user, server, items, keep = 7, base = BASE }) {
+// Called with --if-requested every minute: runs only when the customer's app left a note in
+// requests/ (the "Make a backup now" button), at most once per minGap minutes.
+function exportScript({ project, user, server, items, keep = 7, base = BASE, minGap = 10 }) {
   if (!items.length) throw new Error('Choose at least one thing the customer can download.');
   const head = inner({
     app: 'ServerSnap',
@@ -134,14 +136,30 @@ set -u
 export PATH="$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 umask 027
 U=${q(user)}
-KEEP=${Math.max(1, Math.min(90, Number(keep) || 7))}
+KEEP=${Math.max(1, Math.min(500, Number(keep) || 7))}
 BASE=${q(base)}
+MINGAP=${Math.max(1, Math.min(1440, Number(minGap) || 10))}
 OUT="$BASE/$U/backups"
+REQ="$BASE/$U/requests"
 WORK="$BASE/.work/$U"
 log() { printf '[%s] %s\\n' "$(date '+%F %T')" "$*"; }
+if [ "\${1:-}" = --if-requested ]; then
+  [ -d "$REQ" ] && [ -n "$(ls -A "$REQ" 2>/dev/null)" ] || exit 0
+  ASKED=no; [ -e "$REQ/now" ] && ASKED=yes
+  # empty the folder every time (the customer can only write here; nothing is kept)
+  find "$REQ" -mindepth 1 -delete 2>/dev/null || rm -rf -- "$REQ"/* "$REQ"/.[!.]* 2>/dev/null
+  [ "$ASKED" = yes ] || exit 0
+  LAST=$(ls -1 "$OUT" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_' | sort | tail -n 1)
+  if [ -n "$LAST" ] && [ -n "$(find "$OUT/$LAST" -maxdepth 0 -mmin -"$MINGAP" 2>/dev/null)" ]; then
+    log "The customer asked for a backup, but the last one is less than $MINGAP minutes old. Skipped."; exit 0
+  fi
+  log "The customer asked for a backup now."
+fi
 mkdir -p "$OUT" "$BASE/.work" || exit 1
 exec 9>"$BASE/.work/$U.lock"
 if command -v flock >/dev/null 2>&1; then flock -n 9 || { log "Another copy is already running."; exit 0; }; fi
+# lets the customer's app show "making your backup…"
+touch "$OUT/.running"; trap 'rm -f "$OUT/.running"' EXIT
 STAMP=$(date +%Y-%m-%d_%H-%M-%S); NAME=$STAMP; n=1
 while [ -e "$OUT/$NAME" ]; do n=$((n+1)); NAME="$STAMP-$n"; done
 D="$WORK/$NAME"
@@ -176,18 +194,47 @@ log "Done: $NAME ($STATUS, $TOTAL bytes)"
 `;
 }
 
-function cronFile(user, time) {
+// How often the server makes a customer backup. "time" gives the minute (and the first hour).
+const CLIENT_EVERY = {
+  hourly: { label: 'every hour', hours: 1 },
+  every6h: { label: 'every 6 hours', hours: 6 },
+  every12h: { label: 'every 12 hours', hours: 12 },
+  daily: { label: 'every day', hours: 24 },
+};
+
+function cronWhen(time, every = 'daily') {
   const m = String(time || '03:30').match(/^(\d{1,2}):(\d{2})$/);
   const hh = m ? Math.min(23, Number(m[1])) : 3;
   const mm = m ? Math.min(59, Number(m[2])) : 30;
-  return `# Made by ServerSnap: daily customer backup for ${user}\nSHELL=/bin/bash\n${mm} ${hh} * * * root /usr/local/sbin/serversnap-export-${user} >> /var/log/serversnap-${user}.log 2>&1\n`;
+  const step = (CLIENT_EVERY[every] || CLIENT_EVERY.daily).hours;
+  if (step === 1) return `${mm} * * * *`;
+  const hours = [];
+  for (let h = hh % step; h < 24; h += step) hours.push(h);
+  return `${mm} ${hours.join(',')} * * *`;
+}
+
+// Plain words for the window: "every 6 hours (03:30, 09:30, …)".
+function scheduleText(time, every = 'daily') {
+  const e = CLIENT_EVERY[every] || CLIENT_EVERY.daily;
+  const [mm, hs] = cronWhen(time, every).split(' ');
+  const pad = (n) => String(n).padStart(2, '0');
+  if (hs === '*') return `${e.label}, at minute ${pad(mm)}`;
+  const list = hs.split(',').map((h) => `${pad(h)}:${pad(mm)}`);
+  return `${e.label} at ${list.join(', ')}`;
+}
+
+function cronFile(user, time, every = 'daily') {
+  const job = `/usr/local/sbin/serversnap-export-${user}`;
+  const logTo = `>> /var/log/serversnap-${user}.log 2>&1`;
+  return `# Made by ServerSnap: customer backup for ${user} (${scheduleText(time, every)}), and "Make a backup now" from the customer's app\n` +
+    `SHELL=/bin/bash\n${cronWhen(time, every)} root ${job} ${logTo}\n* * * * * root ${job} --if-requested ${logTo}\n`;
 }
 
 const SSHD_BLOCK = `
-# BEGIN ServerSnap (customer download logins: read-only, own folder only)
+# BEGIN ServerSnap (customer download logins: own folder only; they can read backups/ and write only in requests/)
 Match Group ${GROUP}
     ChrootDirectory ${BASE}/%u
-    ForceCommand internal-sftp -R
+    ForceCommand internal-sftp
     AuthorizedKeysFile ${KEYS_DIR}/%u
     AuthenticationMethods publickey
     AllowTcpForwarding no
@@ -226,15 +273,21 @@ if ! id "$U" >/dev/null 2>&1; then
 fi
 usermod -a -G "$G" "$U"
 usermod -p '*' "$U"
-mkdir -p "$BASE/$U/backups" "$BASE/.work" ${KEYS_DIR}
+mkdir -p "$BASE/$U/backups" "$BASE/$U/requests" "$BASE/.work" ${KEYS_DIR}
 chown root:root "$BASE" "$BASE/$U" /etc/serversnap ${KEYS_DIR}; chmod 755 "$BASE" "$BASE/$U" /etc/serversnap ${KEYS_DIR}
 chown root:"$U" "$BASE/$U/backups"; chmod 750 "$BASE/$U/backups"; chmod 700 "$BASE/.work"
+# the only place the customer can write: a note asking for a backup now
+chown "$U":"$U" "$BASE/$U/requests"; chmod 700 "$BASE/$U/requests"
 printf '%s\\n' ${q(keyLine)} > ${KEYS_DIR}/"$U"; chown root:root ${KEYS_DIR}/"$U"; chmod 644 ${KEYS_DIR}/"$U"
 printf '%s' ${q(b64(script))} | base64 -d > /usr/local/sbin/serversnap-export-"$U"; chmod 700 /usr/local/sbin/serversnap-export-"$U"
 printf '%s' ${q(b64(cron))} | base64 -d > /etc/cron.d/serversnap-"$U"; chmod 644 /etc/cron.d/serversnap-"$U"
-if ! grep -q '^# BEGIN ServerSnap' ${SSHD}; then
+block() { sed -n '/^# BEGIN ServerSnap/,/^# END ServerSnap/p' "$1"; }
+printf '%s' ${q(b64(SSHD_BLOCK))} | base64 -d > /etc/serversnap/sshd-block
+if [ "$(block ${SSHD})" != "$(block /etc/serversnap/sshd-block)" ]; then
+  # add the rule, or replace an older ServerSnap rule
   cp -p ${SSHD} ${SSHD}.serversnap-backup
-  printf '%s' ${q(b64(SSHD_BLOCK))} | base64 -d >> ${SSHD}
+  sed -i '/^# BEGIN ServerSnap/,/^# END ServerSnap/d' ${SSHD}
+  cat /etc/serversnap/sshd-block >> ${SSHD}
   mkdir -p /run/sshd
   S=$(command -v sshd || echo /usr/sbin/sshd)
   if ! E=$("$S" -t 2>&1); then cp -p ${SSHD}.serversnap-backup ${SSHD}; echo "SSH refused the new setting, nothing was changed: $E" >&2; exit 3; fi
@@ -297,5 +350,5 @@ function parseStatus(text) {
 module.exports = {
   BASE, GROUP, SSHD_BLOCK, ROLLBACK_SSHD,
   clientUser, makeKeyPair, encodeCode, decodeCode, itemChoices, manifestItem, fileFor,
-  exportScript, cronFile, installScript, rekeyScript, removeScript, statusScript, parseStatus,
+  CLIENT_EVERY, cronWhen, scheduleText, exportScript, cronFile, installScript, rekeyScript, removeScript, statusScript, parseStatus,
 };

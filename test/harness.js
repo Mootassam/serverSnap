@@ -53,10 +53,23 @@ function serveSftp(sftp, root) {
     h.sent = true;
     sftp.name(id, h.list.map((n) => { const st = fs.statSync(path.join(h.dir, n)); return { filename: n, longname: n, attrs: attrsOf(st) }; }));
   });
+  // Like the real customer login: everything is read-only except the /requests folder.
+  const writable = (v) => v.startsWith('/requests/') && fs.existsSync(path.join(root, 'requests'));
   sftp.on('OPEN', (id, p, flags) => {
-    if (flags & (utils.sftp.OPEN_MODE.WRITE | utils.sftp.OPEN_MODE.CREAT)) return sftp.status(id, STATUS_CODE.PERMISSION_DENIED); // read-only, like internal-sftp -R
-    fs.open(real(p).local, 'r', (e, fd) => (e ? sftp.status(id, STATUS_CODE.NO_SUCH_FILE) : sftp.handle(id, newHandle({ fd }))));
+    const wants = flags & (utils.sftp.OPEN_MODE.WRITE | utils.sftp.OPEN_MODE.CREAT);
+    if (wants && !writable(real(p).v)) return sftp.status(id, STATUS_CODE.PERMISSION_DENIED);
+    fs.open(real(p).local, wants ? 'w' : 'r', (e, fd) => (e ? sftp.status(id, STATUS_CODE.NO_SUCH_FILE) : sftp.handle(id, newHandle({ fd }))));
   });
+  sftp.on('WRITE', (id, hb, offset, data) => {
+    const h = get(hb);
+    fs.write(h.fd, data, 0, data.length, offset, (e) => sftp.status(id, e ? STATUS_CODE.FAILURE : STATUS_CODE.OK));
+  });
+  sftp.on('REMOVE', (id, p) => {
+    if (!writable(real(p).v)) return sftp.status(id, STATUS_CODE.PERMISSION_DENIED);
+    fs.unlink(real(p).local, (e) => sftp.status(id, e ? STATUS_CODE.NO_SUCH_FILE : STATUS_CODE.OK));
+  });
+  sftp.on('FSETSTAT', (id) => sftp.status(id, STATUS_CODE.OK));
+  sftp.on('SETSTAT', (id) => sftp.status(id, STATUS_CODE.PERMISSION_DENIED));
   sftp.on('FSTAT', (id, hb) => { const h = get(hb); fs.fstat(h.fd, (e, st) => (e ? sftp.status(id, STATUS_CODE.FAILURE) : sftp.attrs(id, attrsOf(st)))); });
   sftp.on('READ', (id, hb, offset, length) => {
     const h = get(hb);

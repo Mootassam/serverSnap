@@ -44,11 +44,11 @@ const items = [
   { type: 'volume', name: 'king_upload', label: 'Files: upload' },
 ];
 
-async function runJob(env = {}, keep = 2, list = items) {
+async function runJob(env = {}, keep = 2, list = items, args = '') {
   const script = clients.exportScript({ project: 'king', user: 'snap_king', server: { id: 's1', name: 'King "VPS" \\ main', host: '203.0.113.5' }, items: list, keep, base: uBase });
   const file = path.join(tmp, 'job.sh');
   fs.writeFileSync(file, script);
-  return sh(`PATH=${uBin}:$PATH VOLS=${uVols} bash ${uTmp}/job.sh`, { env });
+  return sh(`PATH=${uBin}:$PATH VOLS=${uVols} bash ${uTmp}/job.sh ${args}`, { env });
 }
 
 const backupsDir = () => path.join(base, 'snap_king', 'backups');
@@ -111,6 +111,42 @@ test('when nothing can be copied, nothing is published', { skip: !SH }, async ()
   assert.notEqual(r.code, 0);
   assert.match(r.stdout, /Nothing could be copied/);
   assert.deepEqual(names(), before);
+});
+
+test('"Make a backup now": the every-minute check only works when the customer asked', { skip: !SH }, async () => {
+  const req = path.join(base, 'snap_king', 'requests');
+  fs.mkdirSync(req, { recursive: true });
+  const before = names();
+  // nothing asked -> nothing happens, silently
+  let r = await runJob({}, 9, items, '--if-requested');
+  assert.equal(r.code, 0);
+  assert.equal(r.stdout, '');
+  assert.deepEqual(names(), before);
+  // only junk in the folder -> it is emptied, no backup
+  fs.writeFileSync(path.join(req, 'junk.bin'), 'x'.repeat(1000));
+  r = await runJob({}, 9, items, '--if-requested');
+  assert.deepEqual(fs.readdirSync(req), []);
+  assert.deepEqual(names(), before);
+  // asked, but the last backup is only seconds old -> skipped (protects the server)
+  fs.writeFileSync(path.join(req, 'now'), 'x');
+  r = await runJob({}, 9, items, '--if-requested');
+  assert.match(r.stdout, /less than 10 minutes old\. Skipped/);
+  assert.deepEqual(fs.readdirSync(req), []);
+  assert.deepEqual(names(), before);
+  // the last backup is older -> a new one is made, and ".running" is gone afterwards
+  for (const n of names()) await sh(`touch -d '30 minutes ago' ${uBase}/snap_king/backups/${n}`);
+  fs.writeFileSync(path.join(req, 'now'), 'x');
+  r = await runJob({}, 9, items, '--if-requested');
+  assert.match(r.stdout, /The customer asked for a backup now/);
+  assert.equal(names().length, before.length + 1);
+  assert.ok(!fs.existsSync(path.join(backupsDir(), '.running')));
+  assert.deepEqual(fs.readdirSync(req), []);
+});
+
+test('nightly line + every-minute line in the cron file', () => {
+  const c = clients.cronFile('snap_king', '03:30');
+  assert.match(c, /^30 3 \* \* \* root \/usr\/local\/sbin\/serversnap-export-snap_king >>/m);
+  assert.match(c, /^\* \* \* \* \* root \/usr\/local\/sbin\/serversnap-export-snap_king --if-requested >>/m);
 });
 
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));

@@ -40,7 +40,14 @@ For project `king` ServerSnap creates, on the server (as root, one script, safe 
 | Its key (only key login; `restrict`) | `/etc/serversnap/keys/snap_king` |
 | Nightly job that copies the chosen databases / volumes / folders | `/usr/local/sbin/serversnap-export-snap_king`, `/etc/cron.d/serversnap-snap_king` |
 | The copies (root-owned, readable by that login only), newest N kept | `/srv/serversnap/snap_king/backups/<date>/` |
-| One SSH rule for the whole group, added once at the **end** of `sshd_config` | `Match Group serversnap-clients` → `ChrootDirectory /srv/serversnap/%u`, `ForceCommand internal-sftp -R`, keys only, no forwarding/TTY |
+| The only folder the login can write to: a note asking for a backup now | `/srv/serversnap/snap_king/requests/` (emptied every minute) |
+| One SSH rule for the whole group, added at the **end** of `sshd_config` | `Match Group serversnap-clients` → `ChrootDirectory /srv/serversnap/%u`, `ForceCommand internal-sftp`, keys only, no forwarding/TTY |
+
+**Make a backup now** (customer app): the app writes `requests/now`; a cron line checks every
+minute (`serversnap-export-snap_king --if-requested`), empties the folder, and makes a backup unless
+the last one is under 10 minutes old. While it runs, `backups/.running` exists; the app waits for the
+new backup and downloads it. Writes anywhere else are refused by folder permissions, and the setup
+check proves it (it tries to write in `/` and `/backups` as the customer and stops if that works).
 
 Safety: `sshd_config` is backed up first (`sshd_config.serversnap-backup`), checked with `sshd -t`
 (put back if refused), then after the reload ServerSnap logs in again with **your** login; if that
@@ -65,7 +72,7 @@ A copy of the app with a file named `client.flag` next to `main.js` always opens
 ## Test
 
 ```
-npm test                 # 46 tests: unit, database scripts, Docker grouping, the nightly customer job
+npm test                 # 53 tests: unit, database scripts, Docker grouping, the nightly customer job
                          # run in bash, real SSH backup → restore, customer SFTP download / stop / damage
 npm run smoke            # opens both apps with sample data and screenshots every page
 ```
