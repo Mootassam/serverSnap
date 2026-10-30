@@ -560,7 +560,8 @@ function registerIpc() {
   handle('settings:get', () => ({ ...store.settings(), defaultBackupRoot: defaultBackupRoot(), version: app.getVersion(), logFile }));
   handle('settings:set', (input) => {
     const out = store.setSettings(input);
-    if (input.startWithWindows !== undefined) app.setLoginItemSettings({ openAtLogin: !!input.startWithWindows, args: ['--hidden'] });
+    // electron.exe needs the app folder as its first argument (installed and dev alike)
+    if (input.startWithWindows !== undefined) app.setLoginItemSettings({ openAtLogin: !!input.startWithWindows, args: [app.getAppPath(), '--hidden'] });
     return out;
   });
   handle('settings:testTelegram', () => notify.telegram(store.telegram(), '✅ ServerSnap is connected. Backup alerts will come here.'));

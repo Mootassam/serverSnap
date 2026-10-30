@@ -69,6 +69,21 @@ npm run client     (or double-click Start-Client.bat)    ServerSnap Client (your
 A copy of the app with a file named `client.flag` next to `main.js` always opens as the Client
 (for a customer installer).
 
+## Windows installers
+
+```
+npm run dist        (= powershell -ExecutionPolicy Bypass -File build.ps1)
+```
+
+Makes `installer_output\ServerSnap-Setup-<version>.exe` and `ServerSnap-Client-Setup-<version>.exe`
+(Inno Setup 6). Per-user install in `%LOCALAPPDATA%\Programs\<app>`, no administrator prompt.
+Built for Windows **Smart App Control**: after installing, only the official, unmodified
+`electron.exe` (plus Windows' own cmd / reg / powershell) ever runs. Shortcuts start
+`electron.exe "<install>\app"`; uninstall is `electron.exe "<install>\app" --uninstall` (`uninstall.js`),
+because Inno's `unins000.exe` is unsigned and would be blocked. ssh2's unused `pagent.exe` is left out.
+The installer `.exe` files themselves are not signed: Windows SmartScreen may show "unknown publisher"
+the first times they are downloaded, until a code-signing certificate is added.
+
 ## Test
 
 ```

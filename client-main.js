@@ -313,7 +313,8 @@ function registerIpc() {
     for (const k of ['downloadRoot', 'autoDownload', 'keep', 'closeToTray', 'startWithWindows']) if (input[k] !== undefined) data.settings[k] = input[k];
     data.settings.keep = Math.max(1, Math.min(365, Number(data.settings.keep) || 14));
     save();
-    if (input.startWithWindows !== undefined) app.setLoginItemSettings({ openAtLogin: !!input.startWithWindows, args: ['--client', '--hidden'] });
+    // electron.exe needs the app folder as its first argument (installed and dev alike)
+    if (input.startWithWindows !== undefined) app.setLoginItemSettings({ openAtLogin: !!input.startWithWindows, args: [app.getAppPath(), '--client', '--hidden'] });
     return data.settings;
   });
   handle('dialog:folder', async (title) => {
