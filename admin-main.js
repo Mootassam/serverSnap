@@ -14,6 +14,13 @@ const { runRestore, planRestore } = require('./src/restore');
 const selection = require('./src/selection');
 const scheduler = require('./src/scheduler');
 const notify = require('./src/notify');
+const deploy = require('./src/deploy');
+const { runDeploy, runRollback, runScript, stampNow } = require('./src/deploy-job');
+const security = require('./src/security');
+const doctor = require('./src/doctor');
+const template = require('./src/template');
+const composeEdit = require('./src/compose-edit');
+const { dnsCheck } = require('./src/deploy-local');
 
 const APP_ID = 'com.serversnap.app';
 app.setAppUserModelId(APP_ID);
@@ -184,7 +191,7 @@ function jobEvent(job, e) {
     if (job.log.length > 2000) job.log.splice(0, job.log.length - 2000);
     log(`[${job.id}] ${e.level}: ${e.msg}`);
   } else if (e.type === 'item') {
-    job.items[e.item.id] = { label: e.item.label, status: e.item.status, bytes: e.item.bytes, sizeKb: e.item.sizeKb };
+    job.items[e.item.id] = { label: e.item.label, status: e.item.status, bytes: e.item.bytes, sizeKb: e.item.sizeKb, detail: e.item.detail };
   } else if (e.type === 'progress') {
     const it = job.items[e.id] || (job.items[e.id] = { label: e.id });
     it.bytes = e.bytes;
@@ -455,6 +462,247 @@ function clientRunJob(serverId, clientId) {
   return publicJob(job);
 }
 
+// ---------- deploy (admin only) ----------
+function deployLinks(serverId) {
+  return (store.get(serverId).deploys || []);
+}
+
+function linkDeploy(serverId, folder) {
+  const list = deployLinks(serverId).filter((d) => path.resolve(d.folder) !== path.resolve(folder));
+  list.push({ folder: path.resolve(folder), addedAt: new Date().toISOString() });
+  list.sort((a, b) => path.basename(a.folder).localeCompare(path.basename(b.folder)));
+  store.patch(serverId, { deploys: list });
+}
+
+function deployCard(serverId, link) {
+  if (!fs.existsSync(link.folder)) return { folder: link.folder, missing: true };
+  try {
+    const d = deploy.detect(link.folder);
+    return { folder: link.folder, saved: d.saved, config: d.config, exposed: d.exposed, last: link.last || null };
+  } catch (err) {
+    return { folder: link.folder, error: err.message };
+  }
+}
+
+// What is running on the server (projects, ports, tools), for the setup window.
+async function deployInspect(serverId) {
+  const fx = smokeFixture('deploy-inspect');
+  if (fx) return fx;
+  return withLive(serverId, async (r) => {
+    if (r.priv === 'none') throw new Error('This login has no root rights on the server.');
+    const insp = deploy.parseInspect(await r.run(deploy.inspectScript(), { root: true, timeoutMs: 60000 }));
+    return { projects: deploy.serverProjects(insp), tools: insp.tools, listening: insp.listening };
+  });
+}
+
+function deployJob(serverId, folder, mode, siteIds) {
+  const server = store.get(serverId);
+  if (!server) throw new Error('Server not found');
+  if (serverBusy(serverId)) throw new Error('Something is already running on this server. Wait for it to finish.');
+  const cfg = deploy.load(folder);
+  const what = { all: 'Deploy', docker: 'Docker start', sites: 'Websites + domains' }[mode] || 'Deploy';
+  const job = newJob('deploy', serverId, `${what}: ${cfg.project} → ${server.name}`);
+  const ev = (e) => jobEvent(job, e);
+  (async () => {
+    try {
+      const res = await runDeploy({ server, folder, mode, siteIds, connect: () => connectServer(serverId), signal: job.controller.signal, onEvent: ev });
+      for (const p of res.problems) ev({ type: 'log', level: 'warn', msg: `Needs a look: ${p}`, at: Date.now() });
+      const links = deployLinks(serverId).map((d) => (path.resolve(d.folder) === path.resolve(folder) ? { ...d, last: { at: new Date().toISOString(), status: res.status, mode, urls: res.urls } } : d));
+      store.patch(serverId, { deploys: links });
+      finishJob(job, res.status === 'ok' ? 'done' : res.status === 'partial' ? 'partial' : 'failed',
+        { status: res.status, urls: res.urls, error: res.status === 'failed' ? res.problems.join(' ') : null });
+    } catch (err) {
+      log(err);
+      ev({ type: 'log', level: 'error', msg: err.message, at: Date.now() });
+      finishJob(job, err.code === 'ABORTED' ? 'stopped' : 'failed', { status: 'failed', error: err.message });
+    } finally {
+      dropLive(serverId);
+      send('servers-changed');
+    }
+  })();
+  return publicJob(job);
+}
+
+function rollbackJob(serverId, folder, siteId) {
+  const server = store.get(serverId);
+  if (serverBusy(serverId)) throw new Error('Something is already running on this server.');
+  const cfg = deploy.load(folder);
+  const site = cfg.sites.find((s) => s.id === siteId);
+  if (!site) throw new Error('Website not found.');
+  const job = newJob('rollback', serverId, `Roll back ${site.domain} on ${server.name}`);
+  const ev = (e) => jobEvent(job, e);
+  (async () => {
+    try {
+      await runRollback({ folder, siteId, connect: () => connectServer(serverId), signal: job.controller.signal, onEvent: ev });
+      finishJob(job, 'done', { status: 'ok' });
+    } catch (err) {
+      log(err);
+      ev({ type: 'log', level: 'error', msg: err.message, at: Date.now() });
+      finishJob(job, err.code === 'ABORTED' ? 'stopped' : 'failed', { status: 'failed', error: err.message });
+    }
+  })();
+  return publicJob(job);
+}
+
+// ---------- security: databases open to the internet (admin only) ----------
+async function securityScan(serverId) {
+  const fx = smokeFixture('security');
+  if (fx) return fx;
+  return withLive(serverId, async (r) => {
+    if (r.priv === 'none') throw new Error('This login has no root rights on the server.');
+    const scan = security.parseScan(await r.run(security.scanScript(), { root: true, timeoutMs: 90000 }));
+    const rep = security.report(scan);
+    // linked project folders on this PC that would open the port again on the next deploy
+    for (const d of rep.dangers) d.localFolders = d.project ? localFoldersFor(serverId, d.project).filter((f) => localExposed(f).length) : [];
+    return rep;
+  });
+}
+
+function localFoldersFor(serverId, project) {
+  return deployLinks(serverId).map((l) => l.folder).filter((f) => {
+    try { return deploy.load(f).project === project; } catch (_) { return deploy.projectNameFrom(f) === project; }
+  });
+}
+
+function localExposed(folder) {
+  try { return deploy.detect(folder).exposed; } catch (_) { return []; }
+}
+
+// Closes the database ports in a project folder on this PC (keeps a copy of the old file).
+function lockLocalFolder(folder) {
+  const c = deploy.readCompose(folder);
+  if (!c) throw new Error(`No docker-compose.yml in ${folder}`);
+  const file = path.join(folder, c.file);
+  const text = fs.readFileSync(file, 'utf8');
+  let env = {};
+  try { env = require('./src/compose').parseEnv(fs.readFileSync(path.join(folder, '.env'), 'utf8')); } catch (_) { /* none */ }
+  const res = composeEdit.lockDatabases(text, env);
+  if (!res.changes.length) return { folder, changes: [] };
+  fs.writeFileSync(`${file}.before-serversnap`, text);
+  fs.writeFileSync(file, res.text);
+  log(`security: closed ${res.changes.map((x) => x.to).join(', ')} in ${file}`);
+  return { folder, changes: res.changes };
+}
+
+function lockJob(serverId, project, services, alsoLocal) {
+  const server = store.get(serverId);
+  if (!server) throw new Error('Server not found');
+  if (serverBusy(serverId)) throw new Error('Something is already running on this server. Wait for it to finish.');
+  const job = newJob('security', serverId, `Close databases: ${project} on ${server.name}`);
+  const say = (msg, level = 'info') => jobEvent(job, { type: 'log', level, msg, at: Date.now() });
+  const step = (id, label, status, detail) => jobEvent(job, { type: 'item', item: { id, label: label || id, status, detail: detail || '' } });
+  (async () => {
+    try {
+      const remote = await connectServer(serverId);
+      try {
+        step('scan', 'Read the compose file on the server', 'running');
+        const scan = security.parseScan(await remote.run(security.scanScript(), { root: true, timeoutMs: 90000 }));
+        const rep = security.report(scan);
+        const targets = rep.dangers.filter((d) => d.project === project && services.includes(d.service));
+        if (!targets.length) { step('scan', null, 'ok', 'Already closed'); finishJob(job, 'done', { status: 'ok' }); return; }
+        const blocked = targets.find((d) => !d.fix.ok);
+        if (blocked) throw new Error(blocked.fix.why);
+        const cfgFile = targets[0].fix.file;
+        const oldText = scan.files[project];
+        const res = security.lockedCompose(scan, project, targets.map((d) => d.service));
+        step('scan', null, 'ok', res.changes.map((x) => `${x.from} → ${x.to}`).join(', '));
+        const labels = { backup: 'Back up the compose file', file: 'Change the ports', restart: 'Restart the database' };
+        const out = await runScript(remote, security.lockScript({ project, file: cfgFile, oldText, newText: res.text, services: [...new Set(targets.map((d) => d.service))], ports: targets.map((d) => d.host), stamp: stampNow() }), {
+          say, signal: job.controller.signal, stepPrefix: 'lock',
+          step: (id, _l, status, detail) => step(id, labels[id.split(':')[1]] || id, status, detail),
+        });
+        if (out.fail) throw new Error(out.fail);
+      } finally {
+        remote.close();
+      }
+      say(`${project}: the database is now only reachable from the server itself. Apps in the same project still reach it by its service name.`);
+      if (alsoLocal) {
+        for (const f of localFoldersFor(serverId, project)) {
+          try {
+            const r = lockLocalFolder(f);
+            if (r.changes.length) say(`Also changed ${f}\\docker-compose.yml, so the next deploy keeps it closed (old file: docker-compose.yml.before-serversnap).`);
+          } catch (e) { say(`Could not change ${f}: ${e.message}`, 'warn'); }
+        }
+      }
+      finishJob(job, 'done', { status: 'ok' });
+    } catch (err) {
+      log(err);
+      say(err.message, 'error');
+      finishJob(job, err.code === 'ABORTED' ? 'stopped' : 'failed', { status: 'failed', error: err.message });
+    } finally {
+      dropLive(serverId);
+    }
+  })();
+  return publicJob(job);
+}
+
+// ---------- Site Doctor (admin only) ----------
+async function doctorCheck(serverId, domainIn, behindProxy) {
+  const domain = doctor.checkDomain(domainIn);
+  const fx = smokeFixture('doctor');
+  if (fx) return fx;
+  const server = store.get(serverId);
+  const [dns, outsideHttps, srv] = await Promise.all([
+    dnsCheck(domain, server.host),
+    doctor.outsideCheck(`https://${domain}/`),
+    withLive(serverId, async (r) => {
+      if (r.priv === 'none') throw new Error('This login has no root rights on the server.');
+      return doctor.parseDoctor(await r.run(doctor.doctorScript(domain), { root: true, timeoutMs: 120000 }));
+    }),
+  ]);
+  let outside = outsideHttps;
+  if (!srv.certFile && !outside.code) outside = await doctor.outsideCheck(`http://${domain}/`);
+  return doctor.diagnose({ domain, dns, outside, server: srv, behindProxy: !!behindProxy });
+}
+
+async function doctorFix(serverId, fix) {
+  if (fix.action === 'start-container' || fix.action === 'restart-container') {
+    const fresh = await dockerView(serverId, false);
+    const c = fresh.groups.flatMap((g) => g.containers).find((x) => x.id.startsWith(fix.id) || fix.id.startsWith(x.id));
+    if (!c) throw new Error('That container is no longer on the server.');
+    const action = fix.action === 'start-container' ? 'start' : 'restart';
+    log(`doctor: ${action} ${c.name} on ${store.get(serverId).name}`);
+    await withLive(serverId, (r) => r.run(docker.actionCommand(action, [c]), { root: true, timeoutMs: 5 * 60 * 1000 }));
+    return `${c.name}: ${action === 'start' ? 'started' : 'restarted'}. Give it a few seconds, then check again.`;
+  }
+  const cmd = doctor.fixCommand(fix);
+  log(`doctor: ${fix.action} on ${store.get(serverId).name}`);
+  const out = await withLive(serverId, (r) => r.run(cmd, { root: true, timeoutMs: 5 * 60 * 1000 }));
+  return String(out || '').trim().split('\n').slice(-2).join(' ') || 'Done.';
+}
+
+// ---------- new client from a template (admin only) ----------
+async function templatePlan(serverId, input) {
+  const server = store.get(serverId);
+  const taken = new Set();
+  const insp = await deployInspect(serverId).catch(() => null);
+  let serverOk = false;
+  if (insp && insp.projects) {
+    serverOk = true;
+    for (const p of insp.projects) for (const port of p.ports || []) taken.add(port);
+    for (const port of insp.listening || []) taken.add(port);
+  }
+  // ports of the other project folders already linked to this server
+  for (const l of deployLinks(serverId)) {
+    try { for (const s of (deploy.readCompose(l.folder) || { services: [] }).services) for (const p of s.ports) if (Number.isInteger(p.host)) taken.add(p.host); } catch (_) { /* unreadable */ }
+  }
+  let serverIp = /^\d+\.\d+\.\d+\.\d+$/.test(server.host) ? server.host : '';
+  if (!serverIp) { try { serverIp = (await require('dns').promises.resolve4(server.host))[0] || ''; } catch (_) { /* unknown */ } }
+  const p = await template.plan({ ...input, taken: [...taken], serverIp: input.serverIp != null ? input.serverIp : serverIp });
+  return { ...p, serverChecked: serverOk };
+}
+
+async function templateCreate(serverId, p) {
+  let last = 0;
+  const res = await template.create(p, {
+    onProgress: (e) => { if (Date.now() - last > 300 || e.done === e.total) { last = Date.now(); send('template-progress', e); } },
+  });
+  linkDeploy(serverId, res.folder);
+  log(`template: ${p.source} -> ${res.folder} (${res.files} files, ${res.changed} changed)`);
+  send('servers-changed');
+  return { folder: res.folder, files: res.files, changed: res.changed, notSaved: res.config && res.config.notSaved };
+}
+
 // ---------- scheduler ----------
 function tick() {
   for (const s of store.data.servers) {
@@ -656,6 +904,27 @@ function registerIpc() {
   handle('docker:logs', (id, containerId, lines) => withLive(id, (r) => r.run(docker.logsCommand(containerId, lines), { root: r.priv !== 'none', timeoutMs: 60000 })));
 
   // Customer download access
+  handle('deploy:list', (id) => deployLinks(id).map((d) => deployCard(id, d)));
+  handle('deploy:detect', (id, folder) => {
+    const d = deploy.detect(folder);
+    return { ...d, domainHint: d.config.mainDomain || '' };
+  });
+  handle('deploy:inspect', (id) => deployInspect(id));
+  handle('deploy:save', (id, folder, cfg) => { const saved = deploy.save(folder, cfg); linkDeploy(id, folder); send('servers-changed'); return saved; });
+  handle('deploy:unlink', (id, folder) => { store.patch(id, { deploys: deployLinks(id).filter((d) => path.resolve(d.folder) !== path.resolve(folder)) }); return true; });
+  handle('deploy:run', (id, folder, mode, siteIds) => deployJob(id, folder, mode, siteIds || null));
+  handle('deploy:rollback', (id, folder, siteId) => rollbackJob(id, folder, siteId));
+  handle('deploy:sites', (id) => withLive(id, async (r) => deploy.parseSites(await r.run(deploy.sitesListScript(), { root: true, timeoutMs: 60000 }))));
+  handle('deploy:openFolder', (folder) => shell.openPath(folder));
+  handle('deploy:openUrl', (url) => { if (/^https?:\/\/[a-z0-9.-]+\/?$/i.test(url)) shell.openExternal(url); return true; });
+  // Security, Site Doctor, new client from a template (admin only)
+  handle('security:scan', (id) => securityScan(id));
+  handle('security:lock', (id, project, services, alsoLocal) => lockJob(id, project, services, !!alsoLocal));
+  handle('deploy:lockLocal', (folder) => lockLocalFolder(folder));
+  handle('doctor:check', (id, domain, behindProxy) => doctorCheck(id, domain, behindProxy));
+  handle('doctor:fix', (id, fix) => doctorFix(id, fix));
+  handle('template:plan', (id, input) => templatePlan(id, input));
+  handle('template:create', (id, p) => templateCreate(id, p));
   handle('clients:choices', (id, project) => clientChoices(id, project));
   handle('clients:save', (id, input) => clientJob(id, input));
   handle('clients:run', (id, clientId) => clientRunJob(id, clientId));

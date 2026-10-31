@@ -44,6 +44,19 @@ const server = {
   keep: 7, lastRun: { at: new Date(Date.now() - 5 * 3600e3).toISOString(), status: 'ok', name: '2026-10-28_03-00-00', bytes: 1.6e9 },
   lastScan: scan,
 };
+// A project folder for the Deploy tab (like D:\Milan).
+const proj = path.join(dir, 'Milan');
+const put = (f, t) => { fs.mkdirSync(path.dirname(path.join(proj, f)), { recursive: true }); fs.writeFileSync(path.join(proj, f), t); };
+put('docker-compose.yml', 'services:\n  backend:\n    build: ./server\n    ports:\n      - 8083:8083\n  db:\n    image: mongo:4.0-xenial\n    ports:\n      - 2737:27017\n  web:\n    build: ./admin\n    ports:\n      - 3055:80\n');
+put('server/package.json', '{"scripts":{"build":"tsc"}}');
+for (const f of ['admin', 'graborders', 'PC']) { put(`${f}/package.json`, '{"scripts":{"build":"vite build"}}'); put(`${f}/index.html`, '<html></html>'); put(`${f}/dist/index.html`, '<html></html>'); }
+const dcfg = require('../src/deploy').detect(proj).config;
+dcfg.mainDomain = 'milan-trade.com';
+for (const x of dcfg.sites) x.domain = { graborders: 'milan-trade.com', PC: 'pc.milan-trade.com', admin: 'admin.milan-trade.com' }[x.id];
+require('../src/deploy').save(proj, dcfg);
+server.deploys = [{ folder: proj, addedAt: new Date().toISOString(), last: { at: new Date(Date.now() - 2 * 3600e3).toISOString(), status: 'ok', mode: 'all', urls: ['https://milan-trade.com'] } }];
+fs.writeFileSync(path.join(dir, 'deploy-inspect.json'), JSON.stringify({ projects: [{ name: 'king', workingDir: '/root/king', containers: 4, running: 4 }, { name: 'milan', workingDir: '/root/Milan', containers: 3, running: 3 }], tools: { docker: 1, nginx: 1, certbot: 1, curl: 1, compose: 2, apt: 1 } }));
+
 fs.writeFileSync(path.join(dir, 'userData', 'serversnap.json'), JSON.stringify({
   version: 1, settings: { backupRoot: root, telegram: { token: '', chatId: '' }, closeToTray: true, startWithWindows: false }, servers: [server],
 }, null, 2));
@@ -91,6 +104,49 @@ const steps = [
   ['15-images-pick', "closeModal(); state.docker.sel='#images'; for (const i of state.docker.data.images) if (!i.usedBy.length) state.docker.pick.images.add(i.id); redrawDocker();"],
   ['16-volumes-pick', "state.docker.sel='#volumes'; redrawDocker(); document.querySelector('.dk-detail .btn').click();"],
 ];
+const deployJob = { id: 'dj', type: 'deploy', serverId: 'srv-1', title: 'Deploy: milan → Shop server', state: 'done', startedAt: Date.now() - 95e3, finishedAt: Date.now(),
+  items: { connect: { label: 'Connect to the server', status: 'ok', detail: '203.0.113.10' }, upload: { label: 'Upload the project', status: 'ok', detail: '5.2 MB' },
+    'up:docker': { label: 'Build and start the containers (can take a few minutes)', status: 'ok', detail: '3 of 3 containers running' },
+    'site:graborders:dns': { label: 'milan-trade.com: domain points to the server', status: 'ok', detail: '203.0.113.10' },
+    'site:graborders:upload': { label: 'milan-trade.com: upload the website', status: 'ok', detail: '48.7 MB' },
+    'site:graborders:nginx': { label: 'milan-trade.com: nginx file', status: 'ok', detail: 'milan-trade.com is served by nginx' },
+    'site:graborders:ssl': { label: 'milan-trade.com: HTTPS', status: 'ok', detail: 'https://milan-trade.com' },
+    'site:graborders:check': { label: 'milan-trade.com: check the website answers', status: 'ok', detail: 'answers 200' } },
+  log: [{ level: 'info', msg: 'Container milan-backend-1  Started', at: Date.now() }, { level: 'info', msg: '✅ https://milan-trade.com is live.', at: Date.now() }],
+  result: { status: 'ok', urls: ['https://milan-trade.com'] } };
+steps.push(
+  ['17-deploy', "go({name:'server', id:'srv-1', tab:'deploy'});"],
+  ['18-deploy-setup', `deployModal(state.servers[0], ${JSON.stringify(proj)});`],
+  ['19-deploy-confirm', `closeModal(); api.call('deploy:list','srv-1').then((l) => { startDeploy(state.servers[0], l[0], 'all'); }); 0;`],
+  ['20-deploy-activity', `closeModal(); state.jobs.set('dj', ${JSON.stringify(deployJob)}); go({name:'activity'});`],
+);
+// Security, Site Doctor and template samples
+const sec = require('../src/security');
+const b64 = (t) => Buffer.from(t).toString('base64');
+const kingFile = 'services:\n  db:\n    image: mongo:4.0-xenial\n    ports:\n      - 2757:27017\n';
+const secReport = sec.report(sec.parseScan(['@@CONTAINERS',
+  'a1\tking-db-1\tmongo:4.0-xenial\tking\tdb\t/root/king\t/root/king/docker-compose.yml\t0.0.0.0:2757->27017/tcp',
+  'a2\tking-backend-1\tking-backend\tking\tbackend\t/root/king\t/root/king/docker-compose.yml\t0.0.0.0:8082->8082/tcp',
+  'a3\tmilan-db-1\tmongo:4.0-xenial\tmilan\tdb\t/root/Milan\t/root/Milan/docker-compose.yml\t0.0.0.0:2737->27017/tcp',
+  'a4\tmilan-web-1\tmilan-web\tmilan\tweb\t/root/Milan\t/root/Milan/docker-compose.yml\t0.0.0.0:3055->80/tcp',
+  '@@USES', '@@LISTEN', '0.0.0.0:22\tusers:(("sshd",pid=1,fd=3))', '0.0.0.0:80\tusers:(("nginx",pid=2,fd=6))', '0.0.0.0:443\tusers:(("nginx",pid=2,fd=7))',
+  '@@FILES', '@@FILE king', b64(kingFile), '@@FILE milan', b64(kingFile.replace('2757', '2737')), '@@UFW', 'Status: inactive', '@@END'].join('\n')));
+for (const d of secReport.dangers) d.localFolders = d.project === 'milan' ? [proj] : [];
+fs.writeFileSync(path.join(dir, 'security.json'), JSON.stringify(secReport));
+const doc = require('../src/doctor').diagnose({ domain: 'milan-trade.com', dns: { ok: true, ips: ['203.0.113.10'], serverIps: ['203.0.113.10'] }, outside: { code: 502, ms: 140, server: 'nginx' },
+  server: { nginx: true, active: 'active', testOk: true, testLines: [], file: '/etc/nginx/sites-enabled/milan-trade.com', root: '/var/www/milan-trade.com/html', index: true,
+    upstreams: ['127.0.0.1:8083'], listen: { 8083: false }, upcode: {}, containers: { 8083: { id: 'b2c3d4e5f6a7', name: 'milan-backend-1', state: 'exited', status: 'Exited (1) 12 minutes ago', restarts: 0 } },
+    logs: { b2c3d4e5f6a7: ['Error: connect ECONNREFUSED 172.18.0.3:6379', '    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1555:16)', 'Node.js v18.20.4'] },
+    certFile: '/etc/letsencrypt/live/milan-trade.com/fullchain.pem', certEnd: new Date(Date.now() + 9 * 864e5).toISOString(), certNames: ['milan-trade.com', 'www.milan-trade.com'],
+    local443: 502, diskPct: 63, memTotal: 3911, memAvail: 1650, errlog: ['2026/10/31 11:02:11 [error] 811#811: *94 connect() failed (111: Connection refused) while connecting to upstream, upstream: "http://127.0.0.1:8083/api/"'] } });
+fs.writeFileSync(path.join(dir, 'doctor.json'), JSON.stringify(doc));
+steps.push(
+  ['21-security', "go({name:'server', id:'srv-1', tab:'security'}); setTimeout(() => document.querySelector('.card .btn.primary').click(), 200);"],
+  ['22-security-close', "lockModal(state.servers[0], 'milan', [" + JSON.stringify(secReport.dangers.find((d) => d.project === 'milan')) + "]); 0;"],
+  ['23-doctor', "closeModal(); state.doctorDomain='milan-trade.com'; go({name:'server', id:'srv-1', tab:'doctor'}); setTimeout(() => document.querySelector('.card .btn.primary').click(), 200);"],
+  ['24-template', `go({name:'server', id:'srv-1', tab:'deploy'}); api.call('deploy:list','srv-1').then((l) => { templateModal(state.servers[0], l); setTimeout(() => { document.querySelector('.modal .row .btn').click(); const d = document.querySelector('.modal input'); d.value = 'newclient.com'; d.dispatchEvent(new Event('input')); }, 200); }); 0;`],
+  ['25-template-preview', "document.querySelector('.modal-foot .btn.primary').click(); 0;"],
+);
 fs.writeFileSync(path.join(dir, 'steps.json'), JSON.stringify(steps));
 
 // The customer app, with one website and two backups waiting.

@@ -24,4 +24,5 @@ contextBridge.exposeInMainWorld('api', {
   onScanStep: on('scan-step'),
   onServersChanged: on('servers-changed'),
   onAccessesChanged: on('accesses-changed'),
+  onTemplateProgress: on('template-progress'),
 });

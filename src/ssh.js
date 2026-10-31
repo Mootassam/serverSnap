@@ -149,7 +149,7 @@ class Remote {
   }
 
   // Runs one command and collects its output.
-  // opts: { root, stdin (string), timeoutMs, signal }
+  // opts: { root, stdin (string), timeoutMs, signal, onData (live output) }
   async exec(command, opts = {}) {
     const { cmd, prefix } = this._wrap(command, opts.root);
     const stream = await this._channel(cmd);
@@ -172,8 +172,8 @@ class Remote {
         opts.signal.addEventListener('abort', onAbort);
       }
       if (opts.timeoutMs) timer = setTimeout(() => fail(new Error(`Command timed out after ${Math.round(opts.timeoutMs / 1000)}s`)), opts.timeoutMs);
-      stream.on('data', (d) => out.push(d));
-      stream.stderr.on('data', (d) => { err = tail(Buffer.concat([err, d])); });
+      stream.on('data', (d) => { out.push(d); if (opts.onData) opts.onData(d); });
+      stream.stderr.on('data', (d) => { err = tail(Buffer.concat([err, d])); if (opts.onData) opts.onData(d); });
       stream.on('exit', (c) => { code = c; });
       stream.on('close', (c) => {
         finish(null, {

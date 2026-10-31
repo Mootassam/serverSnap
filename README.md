@@ -29,6 +29,75 @@ Restore it later on the same server, or on a brand-new one when you move to anot
   kept open while you use it and closed after 3 idle minutes.
 - **Customer download apps** (server → Customers tab): give a customer an access code for
   **ServerSnap Client**. They download only their own website's data (database copy, uploads…).
+- **Deploy** (server → Deploy tab, admin app only): put a project folder from this PC on the server.
+  See below.
+
+## Deploy: project folder → server
+
+Add a project folder (e.g. `D:\Milan`). ServerSnap reads its `docker-compose.yml` (+ `.env`) and its
+website folders (`graborders`, `PC`, `web2`… = folders with `index.html`, `dist/` or a build script),
+suggests everything, and saves the answers in the folder as **`snap.json`**. Then one button:
+
+| Button | Does |
+|---|---|
+| **Deploy everything** | Docker step, then every website |
+| **Docker only** | Upload the project (no `node_modules`, `.git`, or website folders that go up as `dist`) to the server folder, `docker compose -p <project> up -d --build`, count running containers. Stops first if a port is taken by another project. |
+| **Websites + domains only** | The "already hosted" case: the containers are not touched; each website gets its domain + HTTPS |
+
+Each website, in order: DNS check (public DNS; the domain must point straight at the server; a
+Namecheap HTTPS proxy is reported), build on this PC (`npm run build`) or use the `dist` as it is,
+upload next to the live folder (`/var/www/<domain>/html.new`; an existing setup keeps its folder),
+nginx file in `sites-available` + link in `sites-enabled`, `nginx -t`, swap the new files in,
+`certbot --nginx` (redirect to HTTPS, renews itself), then `curl` the site on the server.
+
+nginx files (`src/nginx-templates.js`):
+- **trading**: the King / SHUBH file from `king/nginx-site.sh` (website, `/api/` + `/socket.io/` →
+  `127.0.0.1:<backend port>`, APK, TradingView, `ws.<domain>` for live prices, `$fwd_proto`)
+- **normal**: the Milan graborders file (website, `try_files … /index.html`, asset caching)
+- **container port**: the website runs in Docker; nginx only adds the domain and HTTPS
+
+Safety: old nginx files are kept in `/root/serversnap-deploy/backups/`. Another enabled file that
+served only this domain is switched off (kept there too); a file that also serves other domains is
+never touched (the deploy stops and says so). If `nginx -t` or the final check fails, everything is
+put back (old nginx file, old website files, switched-off files). **Roll back** swaps the previous
+website files and nginx file back (press again to switch forward). Logs on the server:
+`/root/serversnap-deploy/logs/`. Open database ports (`2757:27017`) are flagged in red.
+
+## New client from a template
+
+Deploy tab → **New client from a template**: copy a project you already have (King, SHUBH…) to a new
+folder as a separate client. You give the new domain (and brand name); the preview shows every change:
+
+- **ports**: each published port gets the next free one (looks at the server and the other project folders)
+- **text in the copied files**: old domain → new domain, old brand → new brand (also UPPER / Capitalised),
+  `old server IP:old port` → `this server's IP:new port`, old server IP → this server's IP (only IPs used
+  with a port are ticked; public DNS like 1.1.1.1 is ignored), new random Redis / JWT passwords
+- **database closed** (`127.0.0.1:` in front), files named after the domain renamed, a new `snap.json`
+  with the new domains and ports (websites set to "build", because `dist`/`build` folders are not copied)
+
+Not copied: `node_modules`, `.git`, `dist`/`build` next to a `package.json`. Binary files are copied as
+they are. The template folder is never changed. Logo, colours and texts are left for you.
+
+## Security: open databases
+
+Security tab → **Check now** (read-only): every port open to the internet, with Docker containers,
+plus which apps connect to a database through its public IP:port. Databases (MongoDB, Redis, MySQL,
+PostgreSQL) open to everyone are red. **Close it**: the compose file on the server gets `127.0.0.1:`
+in front of the port (copy kept in `/root/serversnap-deploy/backups/`), only the database service is
+recreated (`up -d --no-deps`; data stays in the volume), then ServerSnap checks the port is closed and
+the database runs. Anything wrong → the old file comes back. Refused when another app reaches the
+database through the public port, or the file changed since the check. Optional: the same change in
+the linked project folder on this PC, so the next deploy keeps it closed. Docker ports skip ufw, so
+ufw alone would not help. App ports (8082, admin) are only listed: admin panels often call them directly.
+
+## Site Doctor: why is my website down?
+
+Site Doctor tab → domain → **Check**. Read-only, about 10 seconds: DNS (public resolvers), the site
+from this PC (status, certificate errors), nginx running / `nginx -t`, the nginx file for the domain,
+`index.html` in its root, each `proxy_pass` port (listening? which container? state, restarts, last
+log lines), the certificate (end date, names), the site on the server itself (`curl --resolve`), disk
+and memory, the nginx error log. The worst finding becomes the answer. Fix buttons: start / restart
+the container, start nginx, `certbot renew` for the domain.
 
 ## Customer access: how it is locked down
 
@@ -87,7 +156,7 @@ the first times they are downloaded, until a code-signing certificate is added.
 ## Test
 
 ```
-npm test                 # 53 tests: unit, database scripts, Docker grouping, the nightly customer job
+npm test                 # 76 tests: unit, database scripts, Docker grouping, the nightly customer job
                          # run in bash, real SSH backup → restore, customer SFTP download / stop / damage
 npm run smoke            # opens both apps with sample data and screenshots every page
 ```
@@ -117,6 +186,13 @@ Every file can also be used by hand: `tar -xzf files/var_www.tar.gz -C /`,
 | `client-main.js` | Customer app: access codes, list / download backups, auto-download |
 | `src/docker.js` | Dashboard: read containers / volumes / images, group per project, actions, logs |
 | `src/clients.js` | Customer logins, access codes, the nightly server job, sshd rule |
+| `src/deploy.js` | Deploy: reads a project folder, `snap.json`, the server scripts (docker up, website, rollback, list) |
+| `src/deploy-job.js`, `src/deploy-local.js` | Deploy steps for the Activity page; build / pack / DNS check on this PC |
+| `src/compose.js`, `src/nginx-templates.js` | Reads docker-compose.yml (+ .env); the nginx files |
+| `src/compose-edit.js` | Changes published ports in a compose file in place (close databases, new ports) |
+| `src/security.js` | Security check script, report, the "close the database" script |
+| `src/doctor.js` | Site Doctor: server check script, check from this PC, findings and fix commands |
+| `src/template.js` | New client from a template: preview and copy with replacements |
 | `src/sftp.js` | Parallel SFTP download with checksum check |
 | `src/ssh.js` | SSH connection, run as root (root / sudo / sudo + password), stream files in and out |
 | `src/scanner.js` | Finds what is on the server |

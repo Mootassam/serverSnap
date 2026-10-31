@@ -79,9 +79,9 @@ async function renderServer(main, id) {
       h('button', { class: 'btn primary', disabled: s.running, onclick: () => startBackup(s.id) }, s.running ? 'Running…' : 'Back up now')),
     last && last.status === 'failed' && last.error ? h('div', { class: 'note bad' }, `Last backup failed: ${last.error}`) : null,
     h('div', { class: 'tabs' },
-      ...[['what', 'What to back up'], ['docker', 'Docker'], ['clients', `Customers${(s.clients || []).length ? ` (${s.clients.length})` : ''}`], ['schedule', 'Schedule & storage']]
+      ...[['what', 'What to back up'], ['docker', 'Docker'], ['deploy', `Deploy${(s.deploys || []).length ? ` (${s.deploys.length})` : ''}`], ['security', 'Security'], ['doctor', 'Site Doctor'], ['clients', `Customers${(s.clients || []).length ? ` (${s.clients.length})` : ''}`], ['schedule', 'Schedule & storage']]
         .map(([k, label]) => h('a', { class: tab === k ? 'active' : '', onclick: () => { state.page.tab = k; render(); } }, label))),
-    tab === 'what' ? whatTab(s, scan) : tab === 'docker' ? dockerTab(s) : tab === 'clients' ? clientsTab(s) : scheduleTab(s));
+    tab === 'what' ? whatTab(s, scan) : tab === 'docker' ? dockerTab(s) : tab === 'deploy' ? deployTab(s) : tab === 'security' ? securityTab(s) : tab === 'doctor' ? doctorTab(s) : tab === 'clients' ? clientsTab(s) : scheduleTab(s));
 }
 
 function whatTab(s, scan) {
@@ -678,6 +678,521 @@ async function clientModal(s, project) {
   load();
 }
 
+// ----- deploy (put project folders from this PC on the server) -----
+const KIND_LABEL = { trading: 'Trading (website + API + live prices)', normal: 'Normal website', proxy: 'Website in a Docker container (port)' };
+const KIND_SHORT = { trading: 'trading', normal: 'normal', proxy: 'container port' };
+
+// Same suggestions as src/deploy.js defaultDomain().
+function suggestDomain(folder, main) {
+  if (!main) return '';
+  const n = folder.toLowerCase();
+  if (['graborders', 'phone', 'mobile', 'web', 'website', 'site', 'frontend', 'client'].includes(n)) return main;
+  if (n === 'pc' || n === 'desktop') return `pc.${main}`;
+  if (n === 'admin') return `admin.${main}`;
+  return `${n.replace(/[^a-z0-9-]/g, '')}.${main}`;
+}
+
+function deployTab(s) {
+  const box = h('div', {}, h('div', { class: 'card' }, h('div', { class: 'muted' }, 'Reading your project folders…')));
+  (async () => {
+    const list = (await safe(() => api.call('deploy:list', s.id))) || [];
+    if (state.page.name !== 'server' || state.page.id !== s.id || state.page.tab !== 'deploy') return;
+    fill(box,
+      h('div', { class: 'card' }, h('div', { class: 'row' },
+        h('div', { style: 'flex:1;min-width:260px' }, h('h2', { style: 'margin:0 0 4px' }, 'Deploy projects to this server'),
+          h('div', { class: 'muted small' }, 'Pick a project folder on this PC. One click uploads it, starts it with Docker Compose, puts its websites on their domains (nginx + HTTPS), checks that they answer, and puts the old version back by itself if something fails.')),
+        h('button', { class: 'btn', onclick: () => templateModal(s, list) }, 'New client from a template'),
+        h('button', { class: 'btn primary', onclick: () => deployModal(s) }, '+ Add a project folder'))),
+      list.length ? list.map((d) => deployCard(s, d)) : h('div', { class: 'card empty' }, h('h1', {}, 'No projects yet'),
+        h('p', {}, 'Press "+ Add a project folder" and choose a folder like D:\\Milan. ServerSnap reads its docker-compose.yml and website folders and suggests everything.')),
+      serverSitesCard(s));
+  })();
+  return box;
+}
+
+function deployCard(s, d) {
+  const name = d.folder.split(/[\\/]/).pop();
+  const remove = h('button', { class: 'btn small ghost', onclick: async () => {
+    if (!(await confirmBox(`Remove ${name} from this list?`, 'Only the link in ServerSnap is removed. Nothing changes on the server or in the folder (snap.json stays).', 'Remove'))) return;
+    if (await safe(() => api.call('deploy:unlink', s.id, d.folder), 'Removed from the list')) { await loadServers(); render(); }
+  } }, 'Remove from list');
+  if (d.missing || d.error) {
+    return h('div', { class: 'card' }, h('h2', {}, name), h('div', { class: 'note bad' }, d.missing ? `The folder ${d.folder} is not on this PC anymore.` : d.error), remove);
+  }
+  const c = d.config;
+  const sites = c.sites.filter((x) => x.enabled);
+  const last = d.last;
+  return h('div', { class: 'card' },
+    h('div', { class: 'row' },
+      h('div', { style: 'flex:1;min-width:240px' },
+        h('h2', { style: 'margin:0' }, c.project, c.docker ? h('span', { class: 'pill' }, 'Docker Compose') : null,
+          last ? h('span', { class: `pill ${last.status === 'ok' ? 'ok' : last.status === 'partial' ? 'warn' : 'bad'}` }, `deployed ${ago(last.at)}`) : h('span', { class: 'pill' }, 'not deployed yet')),
+        h('div', { class: 'muted small mono' }, d.folder, c.docker ? `  →  ${c.remoteDir}` : '')),
+      d.saved ? [
+        h('button', { class: 'btn primary', onclick: () => startDeploy(s, d, 'all') }, 'Deploy everything'),
+        c.docker ? h('button', { class: 'btn', onclick: () => startDeploy(s, d, 'docker') }, 'Docker only') : null,
+        sites.length ? h('button', { class: 'btn', onclick: () => startDeploy(s, d, 'sites') }, 'Websites + domains only') : null,
+      ] : null,
+      h('button', { class: d.saved ? 'btn' : 'btn primary', onclick: () => deployModal(s, d.folder) }, d.saved ? 'Edit' : 'Set up')),
+    d.saved ? null : h('div', { class: 'note' }, 'Not set up yet: press "Set up" to check the suggestions and save them.'),
+    d.exposed.map((x) => h('div', { class: 'note bad' }, `${x.name} (${x.service}) is open to the whole internet on port ${x.host}. Anyone can try to read or delete the database. ` +
+      `Press "Close it" to change "${x.host}:${x.container}" to "127.0.0.1:${x.host}:${x.container}" in docker-compose.yml, then deploy again (or close it on the running server in the Security tab).`,
+      h('div', { style: 'margin-top:6px' }, h('button', { class: 'btn small', onclick: async () => {
+        const r = await safe(() => api.call('deploy:lockLocal', d.folder));
+        if (r) { toast(r.changes.length ? `Closed in ${name}\\docker-compose.yml (old file kept as docker-compose.yml.before-serversnap)` : 'Nothing to change'); render(); }
+      } }, 'Close it in this folder')))),
+    sites.length ? h('table', { style: 'margin-top:10px' },
+      h('tr', {}, h('th', {}, 'Website'), h('th', {}, 'Domain'), h('th', {}, 'nginx'), h('th', {}, 'HTTPS'), h('th', {})),
+      sites.map((x) => h('tr', {},
+        h('td', { class: 'mono' }, x.folder),
+        h('td', {}, h('a', { href: '#', onclick: (e) => { e.preventDefault(); api.call('deploy:openUrl', `${x.ssl ? 'https' : 'http'}://${x.domain}/`); } }, x.domain), x.www ? h('span', { class: 'muted small' }, ' + www') : null),
+        h('td', {}, KIND_SHORT[x.kind], x.kind === 'trading' ? h('span', { class: 'muted small' }, ` → API :${x.backendPort}`) : x.kind === 'proxy' ? h('span', { class: 'muted small' }, ` → :${x.port}`) : null),
+        h('td', {}, x.ssl ? 'yes' : 'no'),
+        h('td', { class: 'actions' },
+          d.saved ? h('button', { class: 'btn small', onclick: () => startDeploy(s, d, 'sites', [x.id]) }, 'Deploy this one') : null,
+          d.saved ? h('button', { class: 'btn small', onclick: () => rollbackSite(s, d, x) }, 'Roll back') : null)))) :
+      h('div', { class: 'muted small', style: 'margin-top:8px' }, 'No website switched on (Docker only).'),
+    h('details', {}, h('summary', {}, 'More'),
+      h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: () => api.call('deploy:openFolder', d.folder) }, 'Open folder'), remove)));
+}
+
+async function startDeploy(s, d, mode, siteIds) {
+  const c = d.config;
+  const sites = c.sites.filter((x) => x.enabled && (!siteIds || siteIds.includes(x.id)));
+  const lines = [];
+  if (mode !== 'sites' && c.docker) lines.push(`Upload ${c.project} to ${c.remoteDir} and run "docker compose up -d --build".`);
+  if (mode !== 'docker') for (const x of sites) lines.push(`${x.domain}: ${x.kind === 'proxy' ? `send to container port ${x.port}` : x.build === 'build' ? `build ${x.folder}, copy it to the server` : `copy ${x.folder}/dist to the server`}, ${KIND_SHORT[x.kind]} nginx file${x.ssl ? ', HTTPS' : ''}.`);
+  const ok = await new Promise((resolve) => {
+    const done = (v) => { closeModal(); resolve(v); };
+    openModal(h('h1', {}, `Deploy ${c.project} to ${s.name}?`),
+      h('ul', {}, lines.map((l) => h('li', {}, l))),
+      h('div', { class: 'note info' }, 'Every step is checked. If nginx or the website check fails, the old setup is put back by itself.'),
+      h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: () => done(false) }, 'Cancel'), h('button', { class: 'btn primary', onclick: () => done(true) }, 'Deploy')));
+  });
+  if (!ok) return;
+  const j = await safe(() => api.call('deploy:run', s.id, d.folder, mode, siteIds || null));
+  if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); }
+}
+
+async function rollbackSite(s, d, x) {
+  if (!(await confirmBox(`Roll back ${x.domain}?`, 'The website files and the nginx file from before the last deploy come back. Press it again to switch to the newer version. Docker containers are not changed.', 'Roll back'))) return;
+  const j = await safe(() => api.call('deploy:rollback', s.id, d.folder, x.id));
+  if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); }
+}
+
+function serverSitesCard(s) {
+  const body = h('div', {}, h('div', { class: 'muted small' }, 'Every domain nginx serves on this server, with its HTTPS certificate date.'));
+  const btn = h('button', { class: 'btn small', onclick: async () => {
+    btn.disabled = true;
+    fill(body, h('div', { class: 'bar indeterminate' }, h('i')));
+    const list = await safe(() => api.call('deploy:sites', s.id));
+    btn.disabled = false;
+    if (!list) { fill(body, h('div', { class: 'note bad' }, 'Could not read the nginx files.')); return; }
+    fill(body, list.length ? h('div', { class: 'table-wrap' }, h('table', {},
+      h('tr', {}, h('th', {}, 'Domain'), h('th', {}, 'Serves'), h('th', {}, 'HTTPS until'), h('th', {}, 'File')),
+      list.map((x) => {
+        const days = x.certUntil ? Math.round((new Date(x.certUntil) - Date.now()) / 86400000) : null;
+        return h('tr', {},
+          h('td', {}, x.names.join(', '), x.ours ? h('span', { class: 'pill ok' }, 'ServerSnap') : null),
+          h('td', { class: 'mono' }, x.proxy || x.root || '—'),
+          h('td', {}, x.certUntil ? h('span', { class: days < 15 ? 'pill bad' : '' }, `${fmtDate(x.certUntil)} (${days} days)`) : x.ssl ? 'yes' : h('span', { class: 'muted' }, 'none')),
+          h('td', { class: 'mono muted' }, x.file));
+      }))) : h('div', { class: 'muted' }, 'nginx serves no domains on this server yet.'));
+  } }, 'Show');
+  return h('div', { class: 'card' }, h('div', { class: 'row' }, h('h2', { style: 'flex:1;margin:0' }, 'Websites on this server'), btn), body);
+}
+
+async function deployModal(s, folder) {
+  if (!folder) {
+    folder = await safe(() => api.call('dialog:folder', 'Choose the project folder (the one with docker-compose.yml)'));
+    if (!folder) return;
+  }
+  openModal(h('h1', {}, 'Set up a project'), h('div', { class: 'muted' }, 'Reading the folder…'), h('div', { class: 'bar indeterminate' }, h('i')));
+  $('#modalCard').classList.add('wide');
+  const d = await safe(() => api.call('deploy:detect', s.id, folder));
+  if (!d) return closeModal();
+  const c = JSON.parse(JSON.stringify(d.config));
+
+  const project = h('input', { type: 'text', value: c.project });
+  const remoteDir = h('input', { type: 'text', value: c.remoteDir });
+  const docker = h('input', { type: 'checkbox', checked: c.docker, disabled: !d.compose });
+  const mainDomain = h('input', { type: 'text', value: c.mainDomain || '', placeholder: 'example.com' });
+  const email = h('input', { type: 'text', value: c.email || '', placeholder: 'optional: you@mail.com (warnings before a certificate expires)' });
+  const err = h('div', { class: 'note bad hidden' });
+  const onServer = h('div', { class: 'muted small' }, 'Looking at what already runs on the server…');
+
+  // one block per website folder
+  const rows = c.sites.map((site) => {
+    const auto = { domain: site.domain || suggestDomain(site.folder, c.mainDomain) };
+    const on = h('input', { type: 'checkbox', checked: site.enabled });
+    const domain = h('input', { type: 'text', value: site.domain || auto.domain, placeholder: suggestDomain(site.folder, 'example.com') });
+    const www = h('input', { type: 'checkbox', checked: site.www });
+    const kind = h('select', {}, ...Object.entries(KIND_LABEL).map(([k, l]) => h('option', { value: k, selected: site.kind === k }, l)));
+    const port = h('input', { type: 'number', min: 1, max: 65535, style: 'width:110px' });
+    const portLabel = h('span', {});
+    const build = h('select', {}, h('option', { value: 'build', selected: site.build === 'build' }, 'Build it now (npm run build)'),
+      h('option', { value: 'dist', selected: site.build !== 'build' }, 'Use the dist folder as it is'));
+    const ssl = h('input', { type: 'checkbox', checked: site.ssl });
+    const ws = h('input', { type: 'checkbox', checked: site.ws });
+    const skipDns = h('input', { type: 'checkbox', checked: site.skipDnsCheck });
+    const portField = h('label', { class: 'field' }, portLabel, port);
+    const buildField = h('label', { class: 'field' }, 'Website files', build);
+    const wsField = h('label', { class: 'check', style: 'border:none;padding:4px' }, ws, h('div', { class: 't' }, 'Live prices on ', h('b', {}, 'ws.' + (domain.value.split('.').slice(-2).join('.') || 'domain'))));
+    const details = h('div', {});
+    const sync = () => {
+      const k = kind.value;
+      portLabel.textContent = k === 'trading' ? 'Backend (API) port' : 'Container port';
+      port.value = k === 'trading' ? (site.backendPort || '') : k === 'proxy' ? (site.port || '') : '';
+      portField.classList.toggle('hidden', k === 'normal');
+      buildField.classList.toggle('hidden', k === 'proxy');
+      wsField.classList.toggle('hidden', k !== 'trading');
+      wsField.querySelector('b').textContent = 'ws.' + (domain.value.split('.').slice(-2).join('.') || 'domain');
+      details.classList.toggle('hidden', !on.checked);
+    };
+    kind.addEventListener('change', sync);
+    port.addEventListener('input', () => { if (kind.value === 'trading') site.backendPort = Number(port.value) || null; else site.port = Number(port.value) || null; });
+    on.addEventListener('change', sync);
+    domain.addEventListener('input', sync);
+    const info = d.folders.find((f) => f.name === site.folder) || {};
+    const hint = [info.service ? `in docker-compose as "${info.service}"${info.servicePort ? ` on port ${info.servicePort}` : ''}` : null,
+      info.hasDist ? 'has dist' : 'no dist yet', info.hasModules ? null : 'no node_modules'].filter(Boolean).join(' · ');
+    fill(details,
+      h('div', { class: 'grid2', style: 'grid-template-columns: 2fr 2fr 1fr 1.4fr; margin-top:8px' },
+        h('label', { class: 'field' }, 'Domain', domain), h('label', { class: 'field' }, 'nginx file', kind), portField, buildField),
+      h('div', { class: 'row', style: 'margin-top:6px' },
+        h('label', { class: 'check', style: 'border:none;padding:4px' }, www, h('div', { class: 't' }, 'Also www.')),
+        h('label', { class: 'check', style: 'border:none;padding:4px' }, ssl, h('div', { class: 't' }, 'HTTPS (free certificate)')),
+        wsField,
+        h('label', { class: 'check', style: 'border:none;padding:4px' }, skipDns, h('div', { class: 't' }, 'Behind Cloudflare / a proxy (skip the DNS check)'))));
+    const el = h('div', { class: 'card', style: 'padding:12px 14px;margin:8px 0' },
+      h('label', { class: 'check', style: 'border:none;padding:0' }, on, h('div', { class: 't' }, h('b', {}, site.folder), h('span', { class: 'muted small' }, hint ? `  ${hint}` : ''))),
+      details);
+    sync();
+    return {
+      el, site, auto, domain,
+      read: () => ({ ...site, enabled: on.checked, domain: domain.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''), www: www.checked, kind: kind.value,
+        backendPort: kind.value === 'trading' ? Number(port.value) || null : site.backendPort, port: kind.value === 'proxy' ? Number(port.value) || null : site.port,
+        build: build.value, ssl: ssl.checked, ws: kind.value === 'trading' && ws.checked, skipDnsCheck: skipDns.checked }),
+    };
+  });
+
+  // typing the main domain fills the website domains that were not changed by hand
+  mainDomain.addEventListener('input', () => {
+    const m = mainDomain.value.trim().toLowerCase();
+    for (const r of rows) {
+      if (!r.domain.value || r.domain.value === r.auto.domain) {
+        r.auto.domain = suggestDomain(r.site.folder, m);
+        r.domain.value = r.auto.domain;
+        r.domain.dispatchEvent(new Event('input'));
+      }
+    }
+  });
+
+  const save = h('button', { class: 'btn primary' }, 'Save');
+  save.addEventListener('click', async () => {
+    err.classList.add('hidden');
+    const cfg = { ...c, project: project.value.trim(), remoteDir: remoteDir.value.trim(), docker: docker.checked, mainDomain: mainDomain.value.trim().toLowerCase(), email: email.value.trim(), sites: rows.map((r) => r.read()) };
+    save.disabled = true;
+    try {
+      await api.call('deploy:save', s.id, folder, cfg);
+    } catch (e) {
+      err.textContent = e.message;
+      err.classList.remove('hidden');
+      save.disabled = false;
+      return;
+    }
+    closeModal();
+    toast(`Saved in ${folder}\\snap.json`);
+    await loadServers();
+    state.page.tab = 'deploy';
+    render();
+  });
+
+  fill($('#modalCard'),
+    h('h1', {}, `Set up ${folder.split(/[\\/]/).pop()}`),
+    h('div', { class: 'muted small mono', style: 'margin:-8px 0 12px' }, folder),
+    d.exposed.map((x) => h('div', { class: 'note bad' }, `${x.name} is open to the internet on port ${x.host}. Safer: "127.0.0.1:${x.host}:${x.container}" in docker-compose.yml.`)),
+    h('div', { class: 'card' }, h('h2', {}, 'Docker'),
+      d.compose ? h('label', { class: 'check', style: 'border:none' }, docker, h('div', { class: 't' }, h('b', {}, 'Upload the project and start it with Docker Compose'),
+        h('div', { class: 'muted small' }, `${d.compose.file}: ${d.compose.services.map((x) => x.name + (x.ports.find((p) => Number.isInteger(p.host)) ? ` :${x.ports.find((p) => Number.isInteger(p.host)).host}` : '')).join(' · ')}`)))
+        : h('div', { class: 'muted' }, 'No docker-compose.yml in this folder: only the websites are deployed.'),
+      h('div', { class: 'grid2', style: 'margin-top:8px' },
+        h('label', { class: 'field' }, 'Project name (docker compose -p)', project),
+        h('label', { class: 'field' }, 'Folder on the server', remoteDir)),
+      h('div', { style: 'margin-top:8px' }, onServer)),
+    h('div', { class: 'card' }, h('h2', {}, 'Websites and domains'),
+      h('div', { class: 'grid2' }, h('label', { class: 'field' }, 'Main domain (fills the website domains for you)', mainDomain), h('label', { class: 'field' }, 'Email for HTTPS', email)),
+      rows.length ? rows.map((r) => r.el) : h('div', { class: 'muted', style: 'margin-top:8px' }, 'No website folders found (folders with index.html, dist/ or a build script).'),
+      h('div', { class: 'note info' }, 'Trading = the King / SHUBH nginx file (website, /api and /socket.io to the backend, APK, TradingView, ws. subdomain). ' +
+        'Normal = the Milan graborders file (just the website). Container port = the website runs in Docker; nginx only adds the domain and HTTPS. ' +
+        'The domain must point to this server (A record). An existing nginx setup for the domain is switched over, and kept so it can be put back.')),
+    err,
+    h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: closeModal }, 'Cancel'), save));
+
+  // what already runs on the server: one click takes its name and folder (the "already hosted" case)
+  const insp = await api.call('deploy:inspect', s.id).catch((e) => ({ error: e.message }));
+  if (insp.error) { onServer.textContent = `Could not look at the server: ${insp.error}`; return; }
+  const t = insp.tools;
+  const missing = ['docker', 'nginx', 'certbot'].filter((k) => !t[k]);
+  fill(onServer,
+    missing.length ? h('div', {}, `Not installed on the server yet: ${missing.join(', ')}`, t.apt && missing.every((k) => k !== 'docker') ? ' (installed for you when needed)' : '') : null,
+    insp.projects.length ? h('div', { class: 'row', style: 'margin-top:4px' }, 'Already running here:',
+      insp.projects.map((p) => h('button', { class: `btn small${p.name === project.value ? ' primary' : ''}`, title: p.workingDir || '',
+        onclick: () => { project.value = p.name; if (p.workingDir) remoteDir.value = p.workingDir; toast(`Using ${p.name} (${p.workingDir || 'folder unknown'}). Deploy "Websites + domains only" to add domains without touching its containers.`); } },
+      `${p.name} ${p.running}/${p.containers}`))) : h('div', {}, 'No Docker projects are running on this server yet.'));
+  const same = insp.projects.find((p) => p.name === project.value);
+  if (same && same.workingDir && !d.saved) remoteDir.value = same.workingDir;
+}
+
+// ----- security: what is open to the internet -----
+function securityTab(s) {
+  const body = h('div', {});
+  const btn = h('button', { class: 'btn primary' }, 'Check now');
+  const run = async () => {
+    btn.disabled = true;
+    fill(body, h('div', { class: 'card' }, h('div', { class: 'muted' }, 'Looking at the open ports and Docker projects…'), h('div', { class: 'bar indeterminate' }, h('i'))));
+    const r = await safe(() => api.call('security:scan', s.id));
+    btn.disabled = false;
+    if (state.page.name !== 'server' || state.page.id !== s.id || state.page.tab !== 'security') return;
+    if (!r) { fill(body); return; }
+    fill(body, securityReport(s, r));
+  };
+  btn.addEventListener('click', run);
+  return h('div', {},
+    h('div', { class: 'card' }, h('div', { class: 'row' },
+      h('div', { style: 'flex:1;min-width:260px' }, h('h2', { style: 'margin:0 0 4px' }, 'Is anything open to the internet?'),
+        h('div', { class: 'muted small' }, 'Bots scan every server all day for open databases. An open MongoDB without a password gets copied, deleted and held for ransom. ' +
+          'Note: ports that Docker publishes skip the ufw firewall, so the fix is in docker-compose.yml.')),
+      btn)),
+    body);
+}
+
+function securityReport(s, r) {
+  const byProject = new Map();
+  for (const d of r.dangers) {
+    const k = d.project || `_${d.container || d.name}`;
+    byProject.set(k, [...(byProject.get(k) || []), d]);
+  }
+  const dangerCards = [...byProject.values()].map((list) => {
+    const d0 = list[0];
+    const fixable = list.filter((d) => d.fix.ok);
+    return h('div', { class: 'card', style: 'border-color:var(--bad)' },
+      h('div', { class: 'row' },
+        h('h2', { style: 'flex:1;margin:0' }, d0.project ? `Project ${d0.project}` : d0.name, h('span', { class: 'pill bad' }, 'open to everyone')),
+        fixable.length ? h('button', { class: 'btn primary danger-fill', onclick: () => lockModal(s, d0.project, fixable) }, fixable.length > 1 ? 'Close them' : 'Close it') : null),
+      list.map((d) => h('div', { style: 'margin-top:8px' },
+        h('div', {}, h('b', {}, d.name), ` on port ${d.host}`, d.container ? h('span', { class: 'muted small mono' }, `  ${d.container} · ${d.image}`) : null),
+        d.fix.ok ? h('div', { class: 'muted small' }, `Will become 127.0.0.1:${d.host}:${d.port} in ${d.fix.file}.`) : h('div', { class: 'note' }, d.fix.why))));
+  });
+  return [
+    r.dangers.length ? h('div', { class: 'note bad' }, h('b', {}, `${r.dangers.length} database${r.dangers.length > 1 ? 's are' : ' is'} open to the whole internet. `),
+      'Close them: the apps keep working, because they reach the database inside Docker by its service name (like mongodb://db:27017).')
+      : h('div', { class: 'note info' }, h('b', {}, 'No database is open to the internet. '), 'Good.'),
+    dangerCards,
+    h('div', { class: 'card' }, h('h2', {}, 'Other open ports'),
+      r.open.length ? h('table', {}, h('tr', {}, h('th', {}, 'Port'), h('th', {}, 'What'), h('th', {})),
+        r.open.map((o) => h('tr', {}, h('td', { class: 'mono' }, o.port), h('td', {}, o.what),
+          h('td', {}, o.kind === 'normal' ? h('span', { class: 'pill ok' }, 'normal') : o.kind === 'app' ? h('span', { class: 'pill' }, 'app port') : h('span', { class: 'pill warn' }, 'check'))))) : h('div', { class: 'muted' }, 'None.'),
+      h('div', { class: 'muted small', style: 'margin-top:8px' }, 'App ports (backend, admin panel) are left as they are: your admin panel may use them directly (like http://IP:8082/api). ' +
+        `Firewall (ufw): ${r.ufw || 'not installed'}.`)),
+  ];
+}
+
+async function lockModal(s, project, list) {
+  const local = [...new Set(list.flatMap((d) => d.localFolders || []))];
+  const also = h('input', { type: 'checkbox', checked: true });
+  const ok = await new Promise((resolve) => {
+    const done = (v) => { closeModal(); resolve(v); };
+    openModal(h('h1', {}, `Close the database${list.length > 1 ? 's' : ''} of ${project}?`),
+      h('ul', {},
+        h('li', {}, `docker-compose.yml on the server: ${list.map((d) => `${d.host}:${d.port} → 127.0.0.1:${d.host}:${d.port}`).join(', ')} (a copy of the old file is kept).`),
+        h('li', {}, `${[...new Set(list.map((d) => d.service))].join(', ')} restart${list.length > 1 ? '' : 's'}: a few seconds without the database. Data stays (it is in the volume).`),
+        h('li', {}, 'ServerSnap checks the port is closed and the database runs again. If anything is wrong, the old file comes back by itself.')),
+      h('div', { class: 'note info' }, 'After this, MongoDB Compass on your PC cannot connect to IP:port directly anymore. Use an SSH tunnel (Compass → "SSH Tunnel" tab, same login as the server).'),
+      local.length ? h('label', { class: 'check' }, also, h('div', { class: 't' }, h('b', {}, `Also change docker-compose.yml in ${local.join(', ')}`),
+        h('div', { class: 'muted small' }, 'Otherwise the next Deploy from this PC opens the port again.'))) : null,
+      h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: () => done(false) }, 'Cancel'), h('button', { class: 'btn primary', onclick: () => done(true) }, 'Close it')));
+  });
+  if (!ok) return;
+  const j = await safe(() => api.call('security:lock', s.id, project, [...new Set(list.map((d) => d.service))], local.length && also.checked));
+  if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); }
+}
+
+// ----- Site Doctor: why is my website down? -----
+const LEVEL_ICON = { ok: '✔', warn: '!', fail: '✖' };
+const LEVEL_COLOR = { ok: 'var(--ok)', warn: 'var(--warn)', fail: 'var(--bad)' };
+
+function doctorTab(s) {
+  const domain = h('input', { type: 'text', placeholder: 'example.com', style: 'flex:1;min-width:220px', value: state.doctorDomain || '' });
+  const cdn = h('input', { type: 'checkbox' });
+  const btn = h('button', { class: 'btn primary' }, 'Check');
+  const chips = h('div', { class: 'row', style: 'margin-top:8px' });
+  const body = h('div', {});
+  const run = async () => {
+    const d = domain.value.trim();
+    if (!d) return domain.focus();
+    state.doctorDomain = d;
+    btn.disabled = true;
+    fill(body, h('div', { class: 'card' }, h('div', { class: 'muted' }, `Checking ${d}: DNS, the internet side, nginx, the app behind it, HTTPS, disk…`), h('div', { class: 'bar indeterminate' }, h('i'))));
+    const r = await safe(() => api.call('doctor:check', s.id, d, cdn.checked));
+    btn.disabled = false;
+    if (state.page.name !== 'server' || state.page.id !== s.id || state.page.tab !== 'doctor') return;
+    fill(body, r ? doctorReport(s, r, run) : null);
+  };
+  btn.addEventListener('click', run);
+  domain.addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
+  (async () => {
+    const list = (await safe(() => api.call('deploy:list', s.id))) || [];
+    const names = [...new Set(list.flatMap((d) => (d.config ? d.config.sites.filter((x) => x.enabled && x.domain).map((x) => x.domain) : [])))];
+    fill(chips, names.length ? ['Your domains:', names.map((n) => h('button', { class: 'btn small', onclick: () => { domain.value = n; run(); } }, n))] : null);
+  })();
+  return h('div', {},
+    h('div', { class: 'card' },
+      h('h2', { style: 'margin:0 0 4px' }, 'Why is my website down?'),
+      h('div', { class: 'muted small', style: 'margin-bottom:10px' }, 'One check of everything between a visitor and your app. You get a plain answer, and a fix button when ServerSnap can fix it.'),
+      h('div', { class: 'row' }, domain, btn),
+      h('label', { class: 'check', style: 'border:none;padding:4px 0' }, cdn, h('div', { class: 't' }, 'This domain is behind Cloudflare / a proxy on purpose')),
+      chips),
+    body);
+}
+
+function doctorReport(s, r, again) {
+  return h('div', {},
+    h('div', { class: `note ${r.level === 'ok' ? 'info' : 'bad'}`, style: r.level === 'warn' ? 'border-color:var(--warn)' : '' }, h('b', {}, r.verdict)),
+    h('div', { class: 'card' },
+      r.findings.map((f) => h('div', { style: 'display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)' },
+        h('div', { style: `width:20px;font-weight:700;color:${LEVEL_COLOR[f.level]}` }, LEVEL_ICON[f.level]),
+        h('div', { style: 'flex:1;min-width:0' },
+          h('div', {}, h('b', {}, f.title), ' — ', f.text),
+          f.fix ? h('button', { class: 'btn small', style: 'margin-top:6px', onclick: async (e) => {
+            e.target.disabled = true;
+            const msg = await safe(() => api.call('doctor:fix', s.id, f.fix));
+            e.target.disabled = false;
+            if (msg) { toast(msg); setTimeout(again, 4000); }
+          } }, f.fix.label) : null,
+          f.logs && f.logs.length ? h('details', {}, h('summary', {}, 'Last lines of its log'), h('pre', { class: 'mono small', style: 'white-space:pre-wrap;max-height:220px;overflow:auto' }, f.logs.join('\n'))) : null))),
+      r.errlog.length ? h('details', { style: 'margin-top:8px' }, h('summary', {}, 'nginx error log (last lines)'), h('pre', { class: 'mono small', style: 'white-space:pre-wrap' }, r.errlog.join('\n'))) : null,
+      h('div', { class: 'row', style: 'margin-top:10px' }, h('button', { class: 'btn', onclick: again }, 'Check again'))));
+}
+
+// ----- new client from a template -----
+async function templateModal(s, linked) {
+  let source = null;
+  const domain = h('input', { type: 'text', placeholder: 'newclient.com' });
+  const brand = h('input', { type: 'text', placeholder: 'newclient' });
+  const target = h('input', { type: 'text', placeholder: 'D:\\NewClient' });
+  const err = h('div', { class: 'note bad hidden' });
+  const picked = h('div', { class: 'muted small mono' }, 'No template chosen yet.');
+  const sources = h('div', { class: 'row' });
+  let targetTouched = false;
+  let brandTouched = false;
+  target.addEventListener('input', () => { targetTouched = true; });
+  brand.addEventListener('input', () => { brandTouched = true; });
+  const suggest = () => {
+    const label = domain.value.trim().toLowerCase().replace(/^https?:\/\//, '').split('.')[0] || '';
+    if (!brandTouched) brand.value = label;
+    if (!targetTouched && source && label) target.value = source.replace(/[\\/][^\\/]+[\\/]?$/, '') + '\\' + label.charAt(0).toUpperCase() + label.slice(1);
+  };
+  domain.addEventListener('input', suggest);
+  const pick = (f) => { source = f; picked.textContent = f; for (const b of sources.children) b.classList.toggle('primary', b.dataset.f === f); suggest(); };
+  fill(sources, (linked || []).filter((d) => d.config).map((d) => h('button', { class: 'btn small', 'data-f': d.folder, onclick: () => pick(d.folder) }, d.folder.split(/[\\/]/).pop())),
+    h('button', { class: 'btn small', onclick: async () => { const f = await safe(() => api.call('dialog:folder', 'Choose the template project (for example D:\\king)')); if (f) pick(f); } }, 'Choose a folder…'));
+  const next = h('button', { class: 'btn primary' }, 'Preview the changes');
+  next.addEventListener('click', async () => {
+    err.classList.add('hidden');
+    if (!source) { err.textContent = 'Choose the template project first.'; err.classList.remove('hidden'); return; }
+    next.disabled = true;
+    next.textContent = 'Reading the template…';
+    try {
+      const p = await api.call('template:plan', s.id, { source, target: target.value.trim(), newDomain: domain.value.trim(), newBrand: brand.value.trim() });
+      templatePreview(s, p);
+    } catch (e) {
+      err.textContent = e.message;
+      err.classList.remove('hidden');
+      next.disabled = false;
+      next.textContent = 'Preview the changes';
+    }
+  });
+  openModal(h('h1', {}, 'New client from a template'),
+    h('div', { class: 'muted', style: 'margin:-6px 0 12px' }, 'Copies a project you already have (like King) to a new folder and makes it a separate client: new domain, brand name, free ports, this server\'s IP, new passwords, database closed. The template folder is not changed.'),
+    h('label', { class: 'field' }, 'Template project', sources), picked,
+    h('div', { class: 'grid2', style: 'margin-top:10px' },
+      h('label', { class: 'field' }, 'New client\'s domain', domain),
+      h('label', { class: 'field' }, 'New brand name (replaces the old one in texts)', brand)),
+    h('label', { class: 'field', style: 'margin-top:8px' }, 'New folder on this PC', target),
+    err,
+    h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: closeModal }, 'Cancel'), next));
+  $('#modalCard').classList.add('wide');
+}
+
+function templatePreview(s, p) {
+  const portRows = p.ports.map((x) => {
+    const inp = h('input', { type: 'number', min: 1, max: 65535, value: x.to, style: 'width:100px' });
+    return { x, inp, el: h('tr', {}, h('td', {}, x.service), h('td', { class: 'mono' }, `${x.from} → `), h('td', {}, inp), h('td', { class: 'muted small' }, `inside the container: ${x.container}`)) };
+  });
+  const pairRows = p.pairs.map((x) => {
+    const on = h('input', { type: 'checkbox', checked: x.on });
+    const to = x.hidden ? null : h('input', { type: 'text', value: x.to, style: 'width:100%' });
+    const el = h('tr', {},
+      h('td', {}, on),
+      h('td', {}, h('b', {}, x.label), h('div', { class: 'muted small' }, `${x.count} times in ${x.files} file${x.files === 1 ? '' : 's'}`)),
+      h('td', { class: 'mono small' }, x.hidden ? h('span', { class: 'muted' }, 'old password') : x.from),
+      h('td', {}, x.hidden ? h('span', { class: 'muted small' }, 'a new random one') : to),
+      h('td', {}, x.examples && x.examples.length ? h('details', {}, h('summary', { class: 'small' }, 'where'), h('pre', { class: 'mono small', style: 'white-space:pre-wrap;max-width:360px' }, x.examples.join('\n'))) : null));
+    return { x, on, to, el };
+  });
+  const lockDb = h('input', { type: 'checkbox', checked: p.lockDb });
+  const err = h('div', { class: 'note bad hidden' });
+  const bar = h('div', { class: 'bar hidden' }, h('i', { style: 'width:0%' }));
+  const go = h('button', { class: 'btn primary' }, 'Create the new client');
+  go.addEventListener('click', async () => {
+    err.classList.add('hidden');
+    const plan = { ...p,
+      ports: portRows.map((r) => ({ ...r.x, to: Number(r.inp.value) || r.x.to })),
+      pairs: pairRows.map((r) => ({ ...r.x, on: r.on.checked, to: r.to ? r.to.value : r.x.to })),
+      lockDb: lockDb.checked };
+    const dup = plan.ports.map((x) => x.to).find((v, i, a) => a.indexOf(v) !== i);
+    if (dup) { err.textContent = `Port ${dup} is used twice.`; err.classList.remove('hidden'); return; }
+    go.disabled = true;
+    go.textContent = 'Copying…';
+    bar.classList.remove('hidden');
+    const off = api.onTemplateProgress((e) => { bar.firstChild.style.width = `${Math.round((e.done / Math.max(1, e.total)) * 100)}%`; });
+    try {
+      const r = await api.call('template:create', s.id, plan);
+      off();
+      await loadServers();
+      openModal(h('h1', {}, 'New client created'),
+        h('p', {}, `${r.folder}: ${r.files} files copied, ${r.changed} changed for the new client.`),
+        r.notSaved ? h('div', { class: 'note bad' }, `Deploy settings need a look: ${r.notSaved.join(' ')}`) : h('div', { class: 'note info' }, 'Deploy settings are ready (snap.json). Websites are built on the first deploy, because the old dist folders hold the old domain.'),
+        h('div', { class: 'note' }, 'Before deploying: point the new domains to this server (A records), and look at the logo, colours and texts — ServerSnap only changed names, addresses and passwords. The new client starts with an empty database.'),
+        h('div', { class: 'modal-foot' },
+          h('button', { class: 'btn', onclick: () => api.call('deploy:openFolder', r.folder) }, 'Open folder'),
+          h('button', { class: 'btn', onclick: () => { closeModal(); state.page.tab = 'deploy'; render(); } }, 'Close'),
+          h('button', { class: 'btn primary', onclick: () => { state.page.tab = 'deploy'; render(); deployModal(s, r.folder); } }, 'Check deploy settings')));
+    } catch (e) {
+      off();
+      err.textContent = e.message;
+      err.classList.remove('hidden');
+      go.disabled = false;
+      go.textContent = 'Create the new client';
+    }
+  });
+  fill($('#modalCard'),
+    h('h1', {}, `${p.source.split(/[\\/]/).pop()} → ${p.target.split(/[\\/]/).pop()}`),
+    h('div', { class: 'muted small mono', style: 'margin:-8px 0 12px' }, `${p.target} · ${p.fileCount} files · ${fmtBytes(p.totalBytes)} · project "${p.project}"`),
+    p.serverChecked ? null : h('div', { class: 'note' }, 'Could not look at the server, so free ports are picked only from your other project folders. Check them below.'),
+    h('div', { class: 'card' }, h('h2', {}, 'Ports (new free ones on this server)'),
+      portRows.length ? h('table', {}, portRows.map((r) => r.el)) : h('div', { class: 'muted' }, 'No published ports in docker-compose.yml.'),
+      h('label', { class: 'check', style: 'border:none;padding:6px 0 0' }, lockDb, h('div', { class: 't' }, h('b', {}, 'Close the database to the internet'), h('div', { class: 'muted small' }, '127.0.0.1 in front of the MongoDB / Redis / MySQL ports')))),
+    h('div', { class: 'card' }, h('h2', {}, 'Text changed in the copied files'),
+      pairRows.length ? h('div', { class: 'table-wrap' }, h('table', {}, h('tr', {}, h('th', {}), h('th', {}, 'What'), h('th', {}, 'Old'), h('th', {}, 'New'), h('th', {})), pairRows.map((r) => r.el)))
+        : h('div', { class: 'muted' }, 'Nothing found to change.'),
+      h('div', { class: 'muted small', style: 'margin-top:6px' }, 'Look at "where" for the brand name: it also changes e-mail addresses and links that contain it.')),
+    p.skipped.length ? h('div', { class: 'muted small' }, `Not copied: ${p.skipped.join(', ')} (installed / built again on deploy).`) : null,
+    err, bar,
+    h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: () => templateModal(s, []) }, 'Back'), go));
+}
+
 async function runScan(id) {
   state.scanStep = { id, step: 'Connecting…' };
   render();
@@ -918,6 +1433,8 @@ function renderActivity(main) {
             h('span', { class: 'muted small' }, it.bytes ? fmtBytes(it.bytes) : ''), it.status ? h('span', { class: `pill ${it.status === 'running' ? 'running' : it.status}` }, it.status) : null),
           it.status === 'running' ? h('div', { class: `bar ${total ? '' : 'indeterminate'}` }, h('i', { style: total ? `width:${pct}%` : '' })) : null);
       })) : null,
+      j.result && j.result.urls && j.result.urls.length ? h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'Live:'),
+        j.result.urls.map((u) => h('button', { class: 'btn small', onclick: () => api.call('deploy:openUrl', u.replace(/\/?$/, '/')) }, u))) : null,
       j.result && j.result.error ? h('div', { class: 'note bad' }, j.result.error) : null,
       logEl);
   });
@@ -989,7 +1506,7 @@ api.onJobEvent(({ jobId, event: e }) => {
   j.items = j.items || {};
   j.log = j.log || [];
   if (e.type === 'log') j.log.push(e);
-  else if (e.type === 'item') j.items[e.item.id] = { label: e.item.label, status: e.item.status, bytes: e.item.bytes, sizeKb: e.item.sizeKb };
+  else if (e.type === 'item') j.items[e.item.id] = { label: e.item.label, status: e.item.status, bytes: e.item.bytes, sizeKb: e.item.sizeKb, detail: e.item.detail };
   else if (e.type === 'progress') { const it = j.items[e.id] || (j.items[e.id] = { label: e.id }); it.bytes = e.bytes; if (e.total) it.total = e.total; }
   else if (e.type === 'step') j.items[`step:${Object.keys(j.items).length}`] = { label: e.label, status: e.status, detail: e.detail };
   scheduleActivityRender();
