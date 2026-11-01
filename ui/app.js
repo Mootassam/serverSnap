@@ -682,8 +682,8 @@ async function clientModal(s, project) {
 }
 
 // ----- deploy (put project folders from this PC on the server) -----
-const KIND_LABEL = { trading: 'Trading (website + API + live prices)', normal: 'Normal website', proxy: 'Website in a Docker container (port)' };
-const KIND_SHORT = { trading: 'trading', normal: 'normal', proxy: 'container port' };
+const KIND_LABEL = { site: 'Website + API', trading: 'Trading (website + API + live prices)', normal: 'Static website (no backend)', proxy: 'Website in a Docker container (port)' };
+const KIND_SHORT = { site: 'site + API', trading: 'trading', normal: 'static', proxy: 'container port' };
 
 // Same suggestions as src/deploy.js defaultDomain().
 function suggestDomain(folder, main) {
@@ -750,7 +750,7 @@ function deployCard(s, d) {
       sites.map((x) => h('tr', {},
         h('td', { class: 'mono' }, x.folder),
         h('td', {}, h('a', { href: '#', onclick: (e) => { e.preventDefault(); api.call('deploy:openUrl', `${x.ssl ? 'https' : 'http'}://${x.domain}/`); } }, x.domain), x.www ? h('span', { class: 'muted small' }, ' + www') : null),
-        h('td', {}, KIND_SHORT[x.kind], x.kind === 'trading' ? h('span', { class: 'muted small' }, ` → API :${x.backendPort}`) : x.kind === 'proxy' ? h('span', { class: 'muted small' }, ` → :${x.port}`) : null),
+        h('td', {}, KIND_SHORT[x.kind], (x.kind === 'trading' || x.kind === 'site') ? h('span', { class: 'muted small' }, ` → API :${x.backendPort}`) : x.kind === 'proxy' ? h('span', { class: 'muted small' }, ` → :${x.port}`) : null),
         h('td', {}, x.ssl ? 'yes' : 'no'),
         h('td', { class: 'actions' },
           d.saved ? h('button', { class: 'btn small', onclick: () => startDeploy(s, d, 'sites', [x.id]) }, 'Deploy this one') : null,
@@ -948,23 +948,30 @@ async function deployModal(s, folder) {
       h('option', { value: 'dist', selected: site.build !== 'build' }, 'Use the dist folder as it is'));
     const ssl = h('input', { type: 'checkbox', checked: site.ssl });
     const ws = h('input', { type: 'checkbox', checked: site.ws });
+    const socket = h('input', { type: 'checkbox', checked: site.socket });
+    const apk = h('input', { type: 'checkbox', checked: site.apk });
     const skipDns = h('input', { type: 'checkbox', checked: site.skipDnsCheck });
     const portField = h('label', { class: 'field' }, portLabel, port);
     const buildField = h('label', { class: 'field' }, 'Website files', build);
     const wsField = h('label', { class: 'check', style: 'border:none;padding:4px' }, ws, h('div', { class: 't' }, 'Live prices on ', h('b', {}, 'ws.' + (domain.value.split('.').slice(-2).join('.') || 'domain'))));
+    const socketField = h('label', { class: 'check', style: 'border:none;padding:4px' }, socket, h('div', { class: 't' }, 'Live updates (socket.io)'));
+    const apkField = h('label', { class: 'check', style: 'border:none;padding:4px' }, apk, h('div', { class: 't' }, 'APK download (.apk files)'));
     const details = h('div', {});
+    const apiKind = (k) => k === 'trading' || k === 'site';
     const sync = () => {
       const k = kind.value;
-      portLabel.textContent = k === 'trading' ? 'Backend (API) port' : 'Container port';
-      port.value = k === 'trading' ? (site.backendPort || '') : k === 'proxy' ? (site.port || '') : '';
+      portLabel.textContent = apiKind(k) ? 'Backend (API) port' : 'Container port';
+      port.value = apiKind(k) ? (site.backendPort || '') : k === 'proxy' ? (site.port || '') : '';
       portField.classList.toggle('hidden', k === 'normal');
       buildField.classList.toggle('hidden', k === 'proxy');
       wsField.classList.toggle('hidden', k !== 'trading');
+      socketField.classList.toggle('hidden', k !== 'site');
+      apkField.classList.toggle('hidden', k !== 'site');
       wsField.querySelector('b').textContent = 'ws.' + (domain.value.split('.').slice(-2).join('.') || 'domain');
       details.classList.toggle('hidden', !on.checked);
     };
     kind.addEventListener('change', sync);
-    port.addEventListener('input', () => { if (kind.value === 'trading') site.backendPort = Number(port.value) || null; else site.port = Number(port.value) || null; });
+    port.addEventListener('input', () => { if (apiKind(kind.value)) site.backendPort = Number(port.value) || null; else site.port = Number(port.value) || null; });
     on.addEventListener('change', sync);
     domain.addEventListener('input', sync);
     const info = d.folders.find((f) => f.name === site.folder) || {};
@@ -976,6 +983,8 @@ async function deployModal(s, folder) {
       h('div', { class: 'row', style: 'margin-top:6px' },
         h('label', { class: 'check', style: 'border:none;padding:4px' }, www, h('div', { class: 't' }, 'Also www.')),
         h('label', { class: 'check', style: 'border:none;padding:4px' }, ssl, h('div', { class: 't' }, 'HTTPS (free certificate)')),
+        socketField,
+        apkField,
         wsField,
         h('label', { class: 'check', style: 'border:none;padding:4px' }, skipDns, h('div', { class: 't' }, 'Behind Cloudflare / a proxy (skip the DNS check)'))));
     const el = h('div', { class: 'card', style: 'padding:12px 14px;margin:8px 0' },
@@ -985,8 +994,8 @@ async function deployModal(s, folder) {
     return {
       el, site, auto, domain,
       read: () => ({ ...site, enabled: on.checked, domain: domain.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, ''), www: www.checked, kind: kind.value,
-        backendPort: kind.value === 'trading' ? Number(port.value) || null : site.backendPort, port: kind.value === 'proxy' ? Number(port.value) || null : site.port,
-        build: build.value, ssl: ssl.checked, ws: kind.value === 'trading' && ws.checked, skipDnsCheck: skipDns.checked }),
+        backendPort: apiKind(kind.value) ? Number(port.value) || null : site.backendPort, port: kind.value === 'proxy' ? Number(port.value) || null : site.port,
+        build: build.value, ssl: ssl.checked, socket: kind.value === 'site' && socket.checked, apk: kind.value === 'site' && apk.checked, ws: kind.value === 'trading' && ws.checked, skipDnsCheck: skipDns.checked }),
     };
   });
 
@@ -1078,7 +1087,158 @@ function securityTab(s) {
         h('div', { class: 'muted small' }, 'Bots scan every server all day for open databases. An open MongoDB without a password gets copied, deleted and held for ransom. ' +
           'Note: ports that Docker publishes skip the ufw firewall, so the fix is in docker-compose.yml.')),
       btn)),
+    body,
+    shieldCard(s),
+    privacyCard(s));
+}
+
+const onSecurity = (s) => state.page.name === 'server' && state.page.id === s.id && state.page.tab === 'security';
+const loadingCard = (msg) => h('div', { class: 'card' }, h('div', { class: 'muted' }, msg), h('div', { class: 'bar indeterminate' }, h('i')));
+
+// ----- Attack Shield: who is trying to break in, and block them -----
+function shieldCard(s) {
+  const body = h('div', {});
+  const btn = h('button', { class: 'btn' }, 'See who is attacking');
+  const run = async () => {
+    btn.disabled = true;
+    fill(body, loadingCard('Reading the SSH and website logs for break-in attempts…'));
+    const r = await safe(() => api.call('shield:status', s.id, {}));
+    btn.disabled = false;
+    if (!onSecurity(s)) return;
+    if (r) { btn.textContent = 'Refresh'; fill(body, shieldReport(s, r, run)); } else fill(body);
+  };
+  btn.addEventListener('click', run);
+  return h('div', { class: 'card', style: 'margin-top:14px' },
+    h('div', { class: 'row' },
+      h('div', { style: 'flex:1;min-width:260px' },
+        h('h2', { style: 'margin:0 0 4px' }, '🛡️ Attack Shield'),
+        h('div', { class: 'muted small' }, 'See who is trying to break in (SSH password guessing and website scanning), and block them with one click.')),
+      btn),
     body);
+}
+
+function shieldReport(s, r, again) {
+  const list = r.attackers || [];
+  if (!list.length) {
+    return h('div', { class: 'note info', style: 'margin-top:10px' }, h('b', {}, 'Nothing nasty right now. '),
+      'No repeated break-in attempts in the recent logs. A clean result is good news.');
+  }
+  const did = (a) => [
+    a.ssh ? `SSH login guessing${a.users.length ? ` (tried: ${a.users.slice(0, 4).join(', ')})` : ''}` : '',
+    a.web ? `website scanning${a.codes.length ? ` (${a.codes.join('/')})` : ''}` : '',
+  ].filter(Boolean).join(' · ') || '—';
+  const block = (ip, undo) => async (e) => {
+    e.target.disabled = true;
+    const msg = await safe(() => api.call('shield:block', s.id, ip, undo));
+    if (msg) { toast(msg); setTimeout(again, 600); } else e.target.disabled = false;
+  };
+  return h('div', { style: 'margin-top:10px' },
+    h('div', { class: 'muted small', style: 'margin-bottom:8px' },
+      `${list.length} IP${list.length > 1 ? 's' : ''} seen attacking · ${r.blocked} blocked by you · ${r.banned} auto-banned by fail2ban.`,
+      r.hasGeo ? null : ' (Install geoiplookup on the server to also see countries.)'),
+    h('div', { style: 'overflow:auto' }, h('table', {},
+      h('tr', {}, h('th', {}, 'IP'), r.hasGeo ? h('th', {}, 'Country') : null, h('th', {}, 'What it did'), h('th', {}, 'Tries'), h('th', {})),
+      list.map((a) => h('tr', {},
+        h('td', { class: 'mono' }, a.ip, a.banned ? h('span', { class: 'pill bad' }, 'banned') : a.blocked ? h('span', { class: 'pill bad' }, 'blocked') : null),
+        r.hasGeo ? h('td', { class: 'small' }, a.country || '—') : null,
+        h('td', { class: 'small' }, did(a)),
+        h('td', { class: 'mono' }, String(a.total)),
+        h('td', {}, a.blocked || a.banned
+          ? h('button', { class: 'btn small', onclick: block(a.ip, true) }, 'Unblock')
+          : h('button', { class: 'btn small danger-fill', onclick: block(a.ip, false) }, 'Block')))))),
+    h('div', { class: 'row', style: 'margin-top:10px' }, h('button', { class: 'btn', onclick: again }, 'Refresh')));
+}
+
+// ----- Privacy & Lockdown -----
+function privacyCard(s) {
+  const body = h('div', {});
+  const btn = h('button', { class: 'btn' }, 'Check');
+  const load = async () => {
+    btn.disabled = true;
+    fill(body, loadingCard('Checking how the server is locked down…'));
+    const c = await safe(() => api.call('privacy:check', s.id));
+    btn.disabled = false;
+    if (!onSecurity(s)) return;
+    if (c) { btn.textContent = 'Re-check'; fill(body, privacyView(s, c, load)); } else fill(body);
+  };
+  btn.addEventListener('click', load);
+  return h('div', { class: 'card', style: 'margin-top:14px' },
+    h('div', { class: 'row' },
+      h('div', { style: 'flex:1;min-width:260px' },
+        h('h2', { style: 'margin:0 0 4px' }, '🔒 Privacy & Lockdown'),
+        h('div', { class: 'muted small' }, 'Lock the server down (key-only SSH, firewall, fail2ban), clear old login records, and auto-delete old logs so your IP does not sit there.')),
+      btn),
+    body);
+}
+
+function statusRow(good, label, detail) {
+  return h('div', { style: 'display:flex;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)' },
+    h('div', { style: `width:20px;font-weight:700;color:${good ? 'var(--ok)' : 'var(--warn)'}` }, good ? '✔' : '!'),
+    h('div', { style: 'flex:1;min-width:0' }, h('b', {}, label), detail ? h('span', { class: 'muted small' }, ' — ' + detail) : null));
+}
+
+function privacyView(s, c, refresh) {
+  const days = h('input', { type: 'number', value: String(c.retentionDays || 14), min: '1', max: '365', style: 'width:80px' });
+  const setRetention = async () => {
+    const j = await safe(() => api.call('privacy:retention', s.id, Number(days.value) || 14));
+    if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); }
+  };
+  return h('div', { style: 'margin-top:10px' },
+    statusRow(!c.passwordLogin, c.passwordLogin ? 'Password login is ON' : 'Password login is OFF', c.passwordLogin ? 'anyone can try to guess your password' : 'only your SSH key works — good'),
+    statusRow(c.keys > 0, c.keys > 0 ? `SSH key installed (${c.keys})` : 'No SSH key installed', c.keys > 0 ? null : 'add your key before turning off password login'),
+    statusRow(c.port !== 22, `SSH port ${c.port}`, c.port === 22 ? 'the default port bots hammer all day' : 'moved off the default — good'),
+    statusRow(c.ufwOn, c.ufwOn ? 'Firewall is on' : 'Firewall is off'),
+    statusRow(c.fail2banOn, c.fail2banOn ? 'fail2ban is on' : 'fail2ban is off', c.fail2banOn ? 'auto-bans password guessers' : null),
+    statusRow(c.retentionDays > 0, c.retentionDays > 0 ? `Logs auto-deleted after ${c.retentionDays} day(s)` : 'Logs are kept forever', c.retentionDays > 0 ? null : 'old login IPs pile up'),
+    c.logins ? h('div', { class: 'muted small', style: 'margin:8px 0' }, `About ${c.logins} past login records are stored on the server.`) : null,
+    h('div', { class: 'row', style: 'margin-top:12px;flex-wrap:wrap;gap:8px' },
+      h('button', { class: 'btn primary', onclick: () => lockdownModal(s, c) }, 'Lock it down…'),
+      h('button', { class: 'btn', onclick: () => clearLoginsModal(s) }, 'Clear old login history…')),
+    h('div', { class: 'row', style: 'margin-top:10px;align-items:center;gap:8px' },
+      h('span', { class: 'muted small' }, 'Auto-delete logs older than'), days, h('span', { class: 'muted small' }, 'days'),
+      h('button', { class: 'btn small', onclick: setRetention }, 'Set')),
+    h('div', { class: 'note info', style: 'margin-top:12px' }, h('b', {}, 'Hide your location best of all: '),
+      'connect through a VPN or a small jump server, so your home/office IP never reaches the server in the first place.'));
+}
+
+async function lockdownModal(s, c) {
+  const keyOnly = h('input', { type: 'checkbox', checked: c.keys > 0 && c.passwordLogin, disabled: c.keys < 1 });
+  const f2b = h('input', { type: 'checkbox', checked: !c.fail2banOn });
+  const fw = h('input', { type: 'checkbox', checked: !c.ufwOn });
+  const portOn = h('input', { type: 'checkbox', checked: c.port === 22 });
+  const portNum = h('input', { type: 'number', value: '2222', min: '1024', max: '65535', style: 'width:90px' });
+  const item = (input, title, detail) => h('label', { class: 'check' }, input, h('div', { class: 't' }, h('b', {}, title), detail ? h('div', { class: 'muted small' }, detail) : null));
+  const ok = await new Promise((resolve) => {
+    const done = (v) => { closeModal(); resolve(v); };
+    openModal(h('h1', {}, 'Lock down ' + s.name),
+      item(keyOnly, 'Key-only SSH (no password login)', c.keys < 1 ? 'Turned off here: no SSH key is installed, so this would lock you out. Add your key first.' : 'Only your SSH key works. Password guessing becomes useless.'),
+      h('label', { class: 'check' }, portOn, h('div', { class: 't' }, h('b', {}, 'Move SSH off port 22 to'), ' ', portNum,
+        h('div', { class: 'muted small' }, 'Bots stop finding it. ServerSnap keeps 22 open until you confirm the new port works.'))),
+      item(f2b, 'fail2ban', 'Auto-bans an IP after 6 wrong SSH tries.'),
+      item(fw, 'Firewall', 'Only SSH, 80 and 443 open to the internet.'),
+      h('div', { class: 'note info' }, 'After this: open a ', h('b', {}, 'new'), ' SSH window and log in to check it works ', h('b', {}, 'before'), ' you close your current one.'),
+      h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: () => done(false) }, 'Cancel'), h('button', { class: 'btn primary', onclick: () => done(true) }, 'Lock it down')));
+  });
+  if (!ok) return;
+  const opts = { keyOnly: keyOnly.checked, fail2ban: f2b.checked, firewall: fw.checked, sshPort: portOn.checked ? Number(portNum.value) || 0 : 0 };
+  if (!opts.keyOnly && !opts.fail2ban && !opts.firewall && !opts.sshPort) return toast('Nothing was ticked.');
+  const j = await safe(() => api.call('privacy:lockdown', s.id, opts));
+  if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); }
+}
+
+async function clearLoginsModal(s) {
+  const web = h('input', { type: 'checkbox' });
+  const ok = await new Promise((resolve) => {
+    const done = (v) => { closeModal(); resolve(v); };
+    openModal(h('h1', {}, 'Clear old login history?'),
+      h('div', { class: 'muted' }, 'This wipes the record of who logged in and from which IP (', h('span', { class: 'mono' }, 'last'), ', ', h('span', { class: 'mono' }, 'lastlog'), ', and the SSH auth logs). Useful so an old office IP is not stored on the server.'),
+      h('label', { class: 'check' }, web, h('div', { class: 't' }, h('b', {}, 'Also clear the website (nginx) access logs'), h('div', { class: 'muted small' }, 'Visitor IP records for your sites.'))),
+      h('div', { class: 'note' }, 'Honest note: these logs are also what show you a break-in. Clear them when things are calm, not during a problem.'),
+      h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: () => done(false) }, 'Cancel'), h('button', { class: 'btn primary', onclick: () => done(true) }, 'Clear it')));
+  });
+  if (!ok) return;
+  const j = await safe(() => api.call('privacy:clear', s.id, web.checked));
+  if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); }
 }
 
 function securityReport(s, r) {

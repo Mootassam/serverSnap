@@ -89,7 +89,7 @@ function makeProject() {
   return proj;
 }
 
-test('detect: suggests trading for phone/PC sites, a port for the container site, admin off', () => {
+test('detect: suggests "site" (website + API) for backend sites, a port for the container site, admin off', () => {
   const proj = makeProject();
   const d = deploy.detect(proj);
   assert.equal(d.saved, false);
@@ -99,8 +99,10 @@ test('detect: suggests trading for phone/PC sites, a port for the container site
   assert.equal(c.docker, true);
   const by = Object.fromEntries(c.sites.map((s) => [s.id, s]));
   assert.deepEqual(Object.keys(by).sort(), ['PC', 'admin', 'graborders', 'web2']);
-  assert.equal(by.graborders.kind, 'trading');
+  assert.equal(by.graborders.kind, 'site');
   assert.equal(by.graborders.backendPort, 8082);
+  assert.equal(by.graborders.socket, false);
+  assert.equal(by.graborders.apk, false);
   assert.equal(by.graborders.build, 'dist');      // no node_modules: use the dist that is there
   assert.equal(by.PC.build, 'build');             // node_modules there: build it
   assert.equal(by.PC.www, false);
@@ -164,6 +166,46 @@ test('nginx files: names, backend on 127.0.0.1, container port', () => {
   assert.doesNotMatch(n, /proxy_pass/);
   const p = deploy.nginxFile(cfg, { kind: 'proxy', domain: 'app.com', www: false, port: 3013 }, null);
   assert.match(p, /proxy_pass http:\/\/127\.0\.0\.1:3013;/);
+});
+
+test('nginx "Website + API": always /api/; socket.io and APK are optional', () => {
+  const cfg = { project: 'nexus' };
+  const base = { kind: 'site', domain: 'nexus.com', www: true, backendPort: 8084 };
+  // plain: API yes, no socket, no apk
+  const plain = deploy.nginxFile(cfg, base, '/var/www/nexus.com/html');
+  assert.match(plain, /location \^~ \/api\/ \{/);
+  assert.match(plain, /proxy_pass http:\/\/127\.0\.0\.1:8084\/api\/;/);
+  assert.match(plain, /try_files \$uri \$uri\/ \/index\.html;/);
+  assert.doesNotMatch(plain, /socket\.io/);
+  assert.doesNotMatch(plain, /\\\.apk\$/);
+  assert.doesNotMatch(plain, /__[A-Z]+__/);
+  assert.doesNotMatch(plain, /tradingview/i, 'no TradingView clutter');
+  // with both toggles on
+  const full = deploy.nginxFile(cfg, { ...base, socket: true, apk: true }, '/var/www/nexus.com/html');
+  assert.match(full, /location \^~ \/socket\.io\/ \{/);
+  assert.match(full, /proxy_pass http:\/\/127\.0\.0\.1:8084;/, 'socket proxies to the backend root');
+  assert.match(full, /location ~\* \\\.apk\$ \{/);
+  assert.match(full, /application\/vnd\.android\.package-archive/);
+  assert.doesNotMatch(full, /__[A-Z]+__/);
+});
+
+test('validate: a "site" needs a backend port', () => {
+  const proj = makeProject();
+  const c = deploy.detect(proj).config;
+  for (const s of c.sites) s.enabled = false;
+  const g = c.sites.find((s) => s.id === 'graborders');
+  g.enabled = true; g.domain = 'nexus.com';
+  assert.equal(g.kind, 'site');
+  g.backendPort = null;
+  assert.match(deploy.validate(c).join(' '), /backend port/);
+  g.backendPort = 8084;
+  assert.deepEqual(deploy.validate(c), []);
+  // socket / apk survive a save + reload
+  g.socket = true; g.apk = true;
+  deploy.save(proj, c);
+  const again = deploy.detect(proj).config.sites.find((s) => s.id === 'graborders');
+  assert.equal(again.socket, true);
+  assert.equal(again.apk, true);
 });
 
 // ---------- the server scripts, run for real ----------

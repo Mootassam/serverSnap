@@ -191,6 +191,16 @@ fs.writeFileSync(path.join(dir, 'dbview.json'), JSON.stringify({
   collections: [['auditlogs', 2210], ['deposits', 318], ['notifications', 940], ['settings', 1], ['tradeorders', 5120], ['transactions', 1204], ['users', 7], ['wallets', 7], ['withdraws', 96]].map(([name, count]) => ({ name, count, size: count * 420 })),
   find: { docs: users, total: users.length, more: false, keys: ['_id', 'email', 'phone', 'username', 'balance', 'vip', 'createdAt', '__v'] },
 }));
+fs.writeFileSync(path.join(dir, 'shield.json'), JSON.stringify({
+  hasGeo: true, blocked: 1, banned: 1,
+  attackers: [
+    { ip: '45.9.148.2', ssh: 412, web: 0, users: ['root', 'admin', 'test', 'oracle'], codes: [], last: '2026-11-01T10:14', banned: 'sshd', blocked: false, total: 412, country: 'Russia' },
+    { ip: '193.106.191.3', ssh: 88, web: 0, users: ['root', 'ubuntu'], codes: [], last: '2026-11-01T09:50', banned: null, blocked: true, total: 88, country: 'Netherlands' },
+    { ip: '198.51.100.7', ssh: 0, web: 146, users: [], codes: ['404', '403'], last: '2026-11-01T10:12', banned: null, blocked: false, total: 146, country: 'United States' },
+    { ip: '203.0.113.9', ssh: 34, web: 11, users: ['admin', 'mysql'], codes: ['404'], last: '2026-11-01T10:01', banned: null, blocked: false, total: 45, country: 'China' },
+  ],
+}));
+fs.writeFileSync(path.join(dir, 'privacy.json'), JSON.stringify({ passwordLogin: true, keys: 1, port: 22, ufwOn: false, fail2banOn: false, retentionDays: 0, logins: 214, passauth: 'yes', sshport: '22' }));
 steps.push(
   ['26-deploy-tools', "closeModal(); go({name:'server', id:'srv-1', tab:'deploy'});"],
   ['27-deploy-backup', "api.call('deploy:list','srv-1').then((l) => { startDeploy(state.servers[0], l[0], 'all'); setTimeout(() => document.querySelector('.section .btn.small').click(), 300); }); 0;"],
@@ -201,6 +211,11 @@ steps.push(
   ['32-db', "closeModal(); go({name:'server', id:'srv-1', tab:'db'});"],
   ['33-db-doc', "document.querySelector('.db-table tr.click td:nth-child(3)').click();"],
   ['34-delete-leftovers', "closeModal(); go({name:'server', id:'srv-1', tab:'docker'}); setTimeout(() => { const g = { name: 'jack', title: 'jack', workingDir: null, containers: [], volumes: ['phone', 'redis_data', 'upload'].map((n, i) => ({ name: 'jack_' + n, role: 'data', usedBy: [], sizeKb: [325000, 3700, 4][i] })), imageIds: [] }; deleteContainersModal(g, [], true); const t = document.querySelector('.modal .field input'); t.value = 'Jack'; t.dispatchEvent(new Event('input')); }, 600);"],
+  ['35-attack-shield', "closeModal(); go({name:'server', id:'srv-1', tab:'security'}); setTimeout(() => { const b = [...document.querySelectorAll('button')].find((x) => /attacking/i.test(x.textContent)); if (b) b.click(); }, 400);"],
+  ['36-privacy', "closeModal(); go({name:'server', id:'srv-1', tab:'security'}); setTimeout(() => { const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'Check'); if (b) b.click(); }, 400);"],
+  ['37-lockdown', "closeModal(); lockdownModal(state.servers[0], { passwordLogin: true, keys: 1, port: 22, ufwOn: false, fail2banOn: false, retentionDays: 0, logins: 214 }); 0;"],
+  ['38-clear-logins', "closeModal(); clearLoginsModal(state.servers[0]); 0;"],
+  ['39-deploy-site-config', "closeModal(); api.call('deploy:list','srv-1').then((l) => deployModal(state.servers[0], l[0].folder)); 0;"],
 );
 fs.writeFileSync(path.join(dir, 'steps.json'), JSON.stringify(steps));
 

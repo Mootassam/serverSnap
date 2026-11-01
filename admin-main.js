@@ -27,6 +27,8 @@ const envEdit = require('./src/env-edit');
 const domainChange = require('./src/domain-change');
 const dbview = require('./src/dbview');
 const deployData = require('./src/deploy-data');
+const attackShield = require('./src/attack-shield');
+const privacy = require('./src/privacy');
 
 const APP_ID = 'com.serversnap.app';
 app.setAppUserModelId(APP_ID);
@@ -765,6 +767,51 @@ function setupJob(serverId, opts) {
   return scriptJob(serverId, 'setup', `Set up ${store.get(serverId).name}`, script, { okText: '✅ The server is ready for deploys.' });
 }
 
+// ---------- Attack Shield & Privacy / Lockdown (admin only) ----------
+async function shieldStatus(serverId, opts) {
+  const fx = smokeFixture('shield');
+  if (fx) return fx;
+  return withLive(serverId, async (r) => {
+    if (r.priv === 'none') throw new Error('This login has no root rights on the server.');
+    const st = attackShield.parseStatus(await r.run(attackShield.statusScript(opts || {}), { root: true, timeoutMs: 90000 }));
+    return { attackers: attackShield.attackers(st), hasGeo: st.hasGeo, banned: st.banned.length, blocked: st.blocked.length };
+  });
+}
+
+async function shieldBlock(serverId, ip, undo) {
+  const script = undo ? attackShield.unblockScript(ip) : attackShield.blockScript(ip);
+  const out = await withLive(serverId, (r) => r.run(script, { root: true, timeoutMs: 60000 }));
+  const res = attackShield.parseResult(out);
+  if (!res.ok) throw new Error(res.error);
+  log(`shield: ${undo ? 'unblocked' : 'blocked'} ${res.ip} on ${store.get(serverId).name}`);
+  return undo ? `Unblocked ${res.ip}.` : `Blocked ${res.ip}. It can no longer reach the server.`;
+}
+
+async function privacyCheck(serverId) {
+  const fx = smokeFixture('privacy');
+  if (fx) return fx;
+  return withLive(serverId, async (r) => {
+    if (r.priv === 'none') throw new Error('This login has no root rights on the server.');
+    return privacy.parseCheck(await r.run(privacy.checkScript(), { root: true, timeoutMs: 60000 }));
+  });
+}
+
+function privacyClear(serverId, web) {
+  log(`privacy: clear logins on ${store.get(serverId).name} (web=${!!web})`);
+  return scriptJob(serverId, 'privacy', `Clear login history on ${store.get(serverId).name}`, privacy.clearLoginsScript({ web: !!web }), { prefix: 'privacy', okText: '✅ Old login records cleared.' });
+}
+
+function privacyRetention(serverId, days) {
+  const n = Math.min(365, Math.max(1, Math.round(Number(days) || 7)));
+  return scriptJob(serverId, 'privacy', `Auto-clean logs on ${store.get(serverId).name}`, privacy.retentionScript(n), { prefix: 'privacy', okText: `✅ Logs older than ${n} day(s) will be deleted by the server itself.` });
+}
+
+function privacyLockdown(serverId, opts) {
+  log(`privacy: lockdown on ${store.get(serverId).name}: ${JSON.stringify(opts || {})}`);
+  return scriptJob(serverId, 'privacy', `Privacy lockdown on ${store.get(serverId).name}`, privacy.lockdownScript(opts || {}),
+    { prefix: 'privacy', okText: '✅ Done. Keep ServerSnap open and test a NEW SSH login before you close your current one.' });
+}
+
 // Websites the watchdog can check, from the linked project folders.
 function watchdogSuggestions(serverId) {
   const sites = [];
@@ -1209,6 +1256,12 @@ function registerIpc() {
   // Security, Site Doctor, new client from a template (admin only)
   handle('security:scan', (id) => securityScan(id));
   handle('security:lock', (id, project, services, alsoLocal) => lockJob(id, project, services, !!alsoLocal));
+  handle('shield:status', (id, opts) => shieldStatus(id, opts || {}));
+  handle('shield:block', (id, ip, undo) => shieldBlock(id, ip, !!undo));
+  handle('privacy:check', (id) => privacyCheck(id));
+  handle('privacy:clear', (id, web) => privacyClear(id, web));
+  handle('privacy:retention', (id, days) => privacyRetention(id, days));
+  handle('privacy:lockdown', (id, opts) => privacyLockdown(id, opts || {}));
   handle('deploy:lockLocal', (folder) => lockLocalFolder(folder));
   handle('doctor:check', (id, domain, behindProxy) => doctorCheck(id, domain, behindProxy));
   handle('doctor:fix', (id, fix) => doctorFix(id, fix));

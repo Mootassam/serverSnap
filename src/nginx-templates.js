@@ -228,9 +228,92 @@ const PROXY = HEADER + `server {
 }
 `;
 
+// "Website + API": a normal React/Vite site that always talks to a backend on /api/,
+// with two optional blocks: live updates (socket.io) and an APK download.
+const SITE_APK = `
+    # APK download
+    location ~* \\.apk$ {
+        add_header Content-Type application/vnd.android.package-archive;
+        add_header Content-Disposition "attachment";
+        add_header Access-Control-Allow-Origin "*";
+        add_header Access-Control-Allow-Methods "GET, HEAD";
+        add_header Cache-Control "public, max-age=3600";
+        add_header X-Content-Type-Options "nosniff";
+        try_files $uri =404;
+    }
+`;
+
+const SITE_SOCKET = `
+    # Live updates (socket.io) -> backend
+    location ^~ /socket.io/ {
+        proxy_pass http://__BACKEND__;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
+        proxy_connect_timeout 86400;
+    }
+`;
+
+function siteTemplate(opts = {}) {
+  return HEADER + `server {
+    listen 80;
+    server_name __NAMES__;
+
+    root __ROOT__;
+    index index.html;
+
+    client_max_body_size 100M;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+${opts.apk ? SITE_APK : ''}
+    # Vite hashed assets: cached for a year
+    location ^~ /assets/ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        access_log off;
+    }
+${opts.socket ? SITE_SOCKET : ''}
+    # Backend API
+    location ^~ /api/ {
+        proxy_pass http://__BACKEND__/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # index.html never cached: visitors always get the newest build
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+    }
+
+    # Other static files
+    location ~* \\.(ico|png|jpg|jpeg|gif|svg|webp|woff|woff2|ttf|eot|json|txt|xml|css|js)$ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=86400";
+        access_log off;
+    }
+
+    # React / Vite single-page app
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+`;
+}
+
 const KINDS = {
+  site: { label: 'Website + API', static: true, builder: siteTemplate },
   trading: { label: 'Trading (website + API + live prices)', static: true, body: TRADING },
-  normal: { label: 'Normal website', static: true, body: NORMAL },
+  normal: { label: 'Static website (no backend)', static: true, body: NORMAL },
   proxy: { label: 'Website in a Docker container (port)', static: false, body: PROXY },
 };
 
@@ -238,4 +321,4 @@ function fillTemplate(body, vars) {
   return body.replace(/__([A-Z]+)__/g, (m, k) => (vars[k] != null ? String(vars[k]) : m));
 }
 
-module.exports = { KINDS, TRADING_WS, FWD_PROTO, fillTemplate };
+module.exports = { KINDS, TRADING_WS, FWD_PROTO, fillTemplate, siteTemplate };

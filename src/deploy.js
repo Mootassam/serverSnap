@@ -124,13 +124,15 @@ function detect(folder) {
         enabled: !isAdmin && !(s.service && !container),
         domain: '',
         www: !['pc', 'admin'].includes(s.name.toLowerCase()),
-        kind: container ? 'proxy' : backend ? 'trading' : 'normal',
+        kind: container ? 'proxy' : backend ? 'site' : 'normal',
         backendPort: backendPort || null,
         port: container ? s.servicePort : null,
         build: s.hasBuild && s.hasModules ? 'build' : 'dist',
         root: null,
         ssl: true,
-        ws: !!backend && !container && !isAdmin,
+        socket: false,
+        apk: false,
+        ws: false,
         skipDnsCheck: false,
       };
     }),
@@ -168,7 +170,7 @@ function validate(cfg) {
     if (domains.has(s.domain)) errs.push(`${label}: ${s.domain} is used twice.`);
     domains.add(s.domain);
     if (!KINDS[s.kind]) errs.push(`${label}: choose the kind of nginx file.`);
-    if (s.kind === 'trading' && !isPort(s.backendPort)) errs.push(`${label}: the backend port is missing.`);
+    if ((s.kind === 'trading' || s.kind === 'site') && !isPort(s.backendPort)) errs.push(`${label}: the backend port is missing.`);
     if (s.kind === 'proxy' && !isPort(s.port)) errs.push(`${label}: the container port is missing.`);
     if (s.root && !isRootDir(s.root)) errs.push(`${label}: the website folder must be inside /var/www.`);
   }
@@ -185,7 +187,8 @@ function save(folder, cfg) {
     sites: (cfg.sites || []).map((s) => ({
       id: s.id || s.folder, folder: s.folder, enabled: !!s.enabled, domain: String(s.domain || '').trim().toLowerCase(), www: !!s.www,
       kind: s.kind, backendPort: s.backendPort ? Number(s.backendPort) : null, port: s.port ? Number(s.port) : null,
-      build: s.build === 'build' ? 'build' : 'dist', root: s.root || null, ssl: s.ssl !== false, ws: !!s.ws, skipDnsCheck: !!s.skipDnsCheck,
+      build: s.build === 'build' ? 'build' : 'dist', root: s.root || null, ssl: s.ssl !== false,
+      socket: !!s.socket, apk: !!s.apk, ws: !!s.ws, skipDnsCheck: !!s.skipDnsCheck,
     })),
   };
   fs.writeFileSync(path.join(folder, CONFIG_FILE), JSON.stringify(clean, null, 2) + '\n');
@@ -334,7 +337,9 @@ function namesFor(site) {
 
 // The nginx file for one website, ready to write.
 function nginxFile(cfg, site, root) {
-  return fillTemplate(KINDS[site.kind].body, {
+  const k = KINDS[site.kind];
+  const body = k.builder ? k.builder({ socket: !!site.socket, apk: !!site.apk }) : k.body;
+  return fillTemplate(body, {
     NAMES: namesFor(site), ROOT: root, BACKEND: `127.0.0.1:${Number(site.backendPort)}`, PORT: Number(site.port), PROJECT: cfg.project,
   });
 }

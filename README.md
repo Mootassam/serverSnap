@@ -51,9 +51,12 @@ nginx file in `sites-available` + link in `sites-enabled`, `nginx -t`, swap the 
 `certbot --nginx` (redirect to HTTPS, renews itself), then `curl` the site on the server.
 
 nginx files (`src/nginx-templates.js`):
+- **Website + API** (the default for a site with a backend): website + `/api/` → `127.0.0.1:<backend port>`,
+  SPA `try_files`, asset caching, `index.html` never cached. Two optional per-site toggles:
+  **live updates (socket.io)** and **APK download**.
 - **trading**: the King / SHUBH file from `king/nginx-site.sh` (website, `/api/` + `/socket.io/` →
   `127.0.0.1:<backend port>`, APK, TradingView, `ws.<domain>` for live prices, `$fwd_proto`)
-- **normal**: the Milan graborders file (website, `try_files … /index.html`, asset caching)
+- **static website**: a plain site, no backend (`try_files … /index.html`, asset caching)
 - **container port**: the website runs in Docker; nginx only adds the domain and HTTPS
 
 Safety: old nginx files are kept in `/root/serversnap-deploy/backups/`. Another enabled file that
@@ -127,6 +130,31 @@ database through the public port, or the file changed since the check. Optional:
 the linked project folder on this PC, so the next deploy keeps it closed. Docker ports skip ufw, so
 ufw alone would not help. App ports (8082, admin) are only listed: admin panels often call them directly.
 
+## Attack Shield: who is trying to break in
+
+Security tab → **See who is attacking** (read-only). Reads the SSH logs (failed passwords, invalid
+users — with the usernames tried) and the nginx logs (scans for `/wp-admin`, `.env`, phpmyadmin…),
+groups them per IP with a count, shows who fail2ban already banned and the IPs you blocked by hand,
+and a rough country when `geoiplookup` is on the server. **Block** adds a ufw deny rule (and a
+fail2ban ban); **Unblock** removes them. Private / loopback / your own kind of address are refused,
+so you cannot lock yourself out.
+
+## Privacy & Lockdown
+
+Security tab → **Privacy & Lockdown** → **Check** shows the state: password login on/off, whether an
+SSH key is installed, the SSH port, firewall, fail2ban, and how long logs are kept.
+
+- **Lock it down**: key-only SSH (**skipped with a warning if no SSH key is installed**, so you are not
+  locked out), move SSH off port 22 (keeps 22 open until you confirm the new port), fail2ban, firewall.
+  `sshd -t` is checked and the change rolled back if it fails. Test a **new** SSH login before closing
+  the old one.
+- **Clear old login history**: empties `wtmp` / `btmp` / `lastlog`, the SSH auth logs and the journal
+  (optionally the nginx access logs), so an old office IP is not stored on the server.
+- **Auto-delete logs older than X days**: a logrotate rule plus a journald retention limit.
+
+To truly hide your location, connect through a VPN or a small jump server so your own IP never reaches
+the server in the first place.
+
 ## Site Doctor: why is my website down?
 
 Site Doctor tab → domain → **Check**. Read-only, about 10 seconds: DNS (public resolvers), the site
@@ -193,7 +221,7 @@ the first times they are downloaded, until a code-signing certificate is added.
 ## Test
 
 ```
-npm test                 # 91 tests: unit, database scripts, Docker grouping, the nightly customer job
+npm test                 # 103 tests: unit, database scripts, Docker grouping, the nightly customer job
                          # run in bash, real SSH backup → restore, customer SFTP download / stop / damage
 npm run smoke            # opens both apps with sample data and screenshots every page
 ```
@@ -237,6 +265,8 @@ Every file can also be used by hand: `tar -xzf files/var_www.tar.gz -C /`,
 | `src/env-edit.js` | .env editor: list, read, write with backup, keep comments, which containers to restart |
 | `src/domain-change.js` | Change domain: find and replace in the project, the 301 redirect on the server |
 | `src/dbview.js` | Database tab: mongo shell commands, Extended JSON both ways, search filters, CSV |
+| `src/attack-shield.js` | Attack Shield: read SSH / nginx attack logs, fail2ban bans, block / unblock an IP |
+| `src/privacy.js` | Privacy & Lockdown: check, clear old logins, log retention, key-only SSH / port / firewall |
 | `src/sftp.js` | Parallel SFTP download with checksum check |
 | `src/ssh.js` | SSH connection, run as root (root / sudo / sudo + password), stream files in and out |
 | `src/scanner.js` | Finds what is on the server |
