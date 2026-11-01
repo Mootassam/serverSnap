@@ -31,9 +31,22 @@ function run(cmd, args, { cwd, onLine, signal, shell = false, env = {} } = {}) {
       if (signal) signal.removeEventListener('abort', onAbort);
       if (signal && signal.aborted) { const e = new Error('Stopped by you.'); e.code = 'ABORTED'; return reject(e); }
       if (code === 0) resolve(tail);
-      else { const e = new Error(tail.trim().split('\n').slice(-4).join('\n') || `${cmd} exited with ${code}`); e.code = code; reject(e); }
+      else { const e = new Error(tail.trim().split('\n').slice(-4).join('\n') || `${cmd} exited with ${code}`); e.code = code; e.tail = tail; reject(e); }
     });
   });
+}
+
+// npm install; old projects often fail npm 7+'s strict peer check (ERESOLVE) although they
+// work fine, so those get one retry with the rules older npm used.
+async function installModules(dir, { onLine, signal } = {}) {
+  const args = ['install', '--no-audit', '--no-fund'];
+  try {
+    await run('npm', args, { cwd: dir, onLine, signal, shell: true });
+  } catch (e) {
+    if (!/ERESOLVE/.test(e.tail || e.message)) throw e;
+    if (onLine) onLine('Old packages disagree about versions (normal for older projects): trying again with --legacy-peer-deps…');
+    await run('npm', [...args, '--legacy-peer-deps'], { cwd: dir, onLine, signal, shell: true });
+  }
 }
 
 // npm run build in a website folder (npm install first when node_modules is missing).
@@ -41,7 +54,7 @@ function run(cmd, args, { cwd, onLine, signal, shell = false, env = {} } = {}) {
 async function buildSite(dir, { onLine, signal, script = 'build' } = {}) {
   if (!fs.existsSync(path.join(dir, 'node_modules'))) {
     if (onLine) onLine('node_modules is missing: running npm install first (this can take a few minutes)…');
-    await run('npm', ['install', '--no-audit', '--no-fund'], { cwd: dir, onLine, signal, shell: true });
+    await installModules(dir, { onLine, signal });
   }
   await run('npm', ['run', script], { cwd: dir, onLine, signal, shell: true, env: { CI: 'false' } });
   return distOf(dir);
