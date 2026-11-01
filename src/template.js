@@ -11,7 +11,7 @@ const deploy = require('./deploy');
 const { parseCompose, parseEnv } = require('./compose');
 const { remapPorts, lockDatabases } = require('./compose-edit');
 
-const SKIP_DIRS = new Set(['node_modules', '.git', '.claude', '.vscode', '.idea', '.next', '.cache', '.turbo', 'coverage']);
+const SKIP_DIRS = new Set(['node_modules', '.git', '.serversnap-backup', '.claude', '.vscode', '.idea', '.next', '.cache', '.turbo', 'coverage']);
 const BUILD_DIRS = new Set(['dist', 'build']); // skipped when next to a package.json: they hold the old domain, rebuilt on deploy
 const SKIP_FILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']); // copied as they are
 const MAX_TEXT = 4 * 1024 * 1024;

@@ -63,6 +63,43 @@ put back (old nginx file, old website files, switched-off files). **Roll back** 
 website files and nginx file back (press again to switch forward). Logs on the server:
 `/root/serversnap-deploy/logs/`. Open database ports (`2757:27017`) are flagged in red.
 
+### Before, during and after a deploy
+
+- **Checks first.** The websites are built on this PC, then the server is checked: Docker and
+  Compose installed, ports free, disk space (stops under 1 GB free, warns under 3 GB), memory, and
+  every domain points to the server. Nothing on the server changes until all of it passes.
+- **Only what changed travels.** ServerSnap hashes the project files (sha1) and asks the server for
+  its copy's hashes; only new or changed files go up. Files that live only on the server (uploads,
+  data) are never removed. A website starts from a copy of the live folder (so the APK and images do
+  not travel again) and ends as an exact copy of `dist`. "Send every file again" forces a full upload.
+- **Cleanup.** After every container started fine, old Docker leftovers are deleted (`image prune`,
+  build cache older than a week). The images of the version that was running before stay, tagged
+  `:serversnap-prev`.
+- **Deploy with a backup.** Pick the customer's backup (a ServerSnap / Client backup folder, a
+  MongoDB dump: `.archive`, `.gz` or a dump folder, a `.sql` / `.sql.gz`, or a `.zip` /
+  `.tar.gz` of files). After the upload, the backend is stopped, only the database container starts,
+  a safety copy of its current data is saved in `/root/serversnap-deploy/backups/`, the backup is
+  loaded (Mongo databases can be renamed, e.g. `trade` → `grap`), files go into a project folder or
+  a volume, and then the whole project starts. If loading fails, the safety copy is put back.
+
+### Tools on the Deploy tab
+
+| Tool | Does |
+|---|---|
+| **Set up server** | Fresh Ubuntu / Debian VPS: git + tools, Docker + Compose (log size limits), nginx, certbot, Node.js (optional), swap file, firewall (SSH port first, then 80 / 443), fail2ban, automatic security updates, time zone. Shows what is installed first; anything already there is skipped; a failed part does not stop the others. |
+| **Auto-repair** | A cron job on the server (`/usr/local/sbin/serversnap-watchdog`, every minute): starts crashed containers (not ones stopped by hand), restarts unhealthy ones, restarts the container behind a site that answers 502 / 503 / 504 three minutes in a row, starts nginx, cleans the disk at 90 %. At most 3 repairs per thing per hour, then "Gave up". Log: `/var/log/serversnap-watchdog.log`, shown in the app. |
+| **Settings (.env)** | Edit the project's `.env` files on the server. The old file is kept next to it (last 5), comments and order stay, secrets are hidden until clicked. Suggests which containers read the file (root `.env` → all, `env_file:`, build folder → rebuild) and restarts / rebuilds them. Can write the same file in the folder on this PC, so the next deploy does not bring the old values back. |
+| **Change domain** | Checks the new domains point to the server (changes nothing otherwise), writes the new domain into the project files that name the old one (old copies in `.serversnap-backup/`), saves `snap.json`, deploys (the containers too when backend files changed), then the old domain answers with a 301 to the new one, keeping its certificate. |
+
+## Database tab
+
+MongoDB containers on the server (mongosh or the old `mongo` shell inside the container, logged in
+with the container's root user when it has one). Databases, collections with counts, documents 20
+per page. Search any usual field (email, phone, username…), one field, or a MongoDB JSON filter.
+Open a document to edit it as JSON (ids and dates stay `{"$oid"}` / `{"$date"}`), add, delete,
+delete selected, delete all search results, export to CSV (Excel) or JSON, empty or delete a
+collection, delete a database. Destructive actions ask you to type the name first.
+
 ## New client from a template
 
 Deploy tab → **New client from a template**: copy a project you already have (King, SHUBH…) to a new
@@ -156,7 +193,7 @@ the first times they are downloaded, until a code-signing certificate is added.
 ## Test
 
 ```
-npm test                 # 76 tests: unit, database scripts, Docker grouping, the nightly customer job
+npm test                 # 91 tests: unit, database scripts, Docker grouping, the nightly customer job
                          # run in bash, real SSH backup → restore, customer SFTP download / stop / damage
 npm run smoke            # opens both apps with sample data and screenshots every page
 ```
@@ -193,6 +230,13 @@ Every file can also be used by hand: `tar -xzf files/var_www.tar.gz -C /`,
 | `src/security.js` | Security check script, report, the "close the database" script |
 | `src/doctor.js` | Site Doctor: server check script, check from this PC, findings and fix commands |
 | `src/template.js` | New client from a template: preview and copy with replacements |
+| `src/deploy-sync.js` | Upload only what changed, checks before deploy, Docker cleanup |
+| `src/deploy-data.js` | Deploy with a backup: read backups and dumps, load them before the backend starts |
+| `src/server-setup.js` | Set up server: check script and the install script |
+| `src/watchdog.js` | Auto-repair: the watchdog script, install / remove / status |
+| `src/env-edit.js` | .env editor: list, read, write with backup, keep comments, which containers to restart |
+| `src/domain-change.js` | Change domain: find and replace in the project, the 301 redirect on the server |
+| `src/dbview.js` | Database tab: mongo shell commands, Extended JSON both ways, search filters, CSV |
 | `src/sftp.js` | Parallel SFTP download with checksum check |
 | `src/ssh.js` | SSH connection, run as root (root / sudo / sudo + password), stream files in and out |
 | `src/scanner.js` | Finds what is on the server |
@@ -201,12 +245,12 @@ Every file can also be used by hand: `tar -xzf files/var_www.tar.gz -C /`,
 | `src/restore.js` | Restore and migrate |
 | `src/selection.js` | Remembers ticks; new items are included automatically |
 | `src/scheduler.js`, `src/notify.js`, `src/store.js` | Schedule maths, Telegram, saved settings |
-| `ui/` | The windows (plain HTML/CSS/JS): `index.html`/`app.js` admin, `client.html`/`client.js` customer, `common.js` shared |
+| `ui/` | The windows (plain HTML/CSS/JS): `index.html`/`app.js` admin, `client.html`/`client.js` customer, `common.js` shared, `tools.js` the Deploy tools and the Database tab |
 
 ## Not yet (version 2 ideas)
 
 - Encrypted backups (password), and sending them to Google Drive / S3 / another VPS
-- Smart backups that only send changed files
+- Smart backups that only send changed files (deploys already do)
 - A "test restore" into a throw-away server
 - Saving Docker images (images are pulled again on restore; locally built ones are rebuilt from the project folder)
 - Windows installer (`.exe`)

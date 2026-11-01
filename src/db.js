@@ -90,6 +90,11 @@ if [ "$LOGIN" = root ]; then exec "$C" -uroot; else exec "$C" -u"$LOGIN" "$DB"; 
   }
 }
 
+// mongorestore with extra arguments (already shell words), e.g. "--archive --gzip --nsFrom 'a.*' --nsTo 'b.*'".
+function mongoRestoreCommand(container, args) {
+  return inContainer(container, `${MONGO_PREP}\nexec mongorestore "$@" --drop ${args}`, true);
+}
+
 // Exit 0 only when the *real* server is up (not the temporary one the official images
 // run while they initialise a new database).
 function readyCommand(kind, container) {
@@ -136,4 +141,4 @@ const HOST = {
   },
 };
 
-module.exports = { KINDS, HOST, kindFromImage, dumpScript, dumpCommand, loadCommand, readyCommand };
+module.exports = { KINDS, HOST, kindFromImage, dumpScript, dumpCommand, loadCommand, mongoRestoreCommand, readyCommand, inContainer };

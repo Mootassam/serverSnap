@@ -20,7 +20,13 @@ const security = require('./src/security');
 const doctor = require('./src/doctor');
 const template = require('./src/template');
 const composeEdit = require('./src/compose-edit');
-const { dnsCheck } = require('./src/deploy-local');
+const { dnsCheck, dnsMessage } = require('./src/deploy-local');
+const serverSetup = require('./src/server-setup');
+const watchdog = require('./src/watchdog');
+const envEdit = require('./src/env-edit');
+const domainChange = require('./src/domain-change');
+const dbview = require('./src/dbview');
+const deployData = require('./src/deploy-data');
 
 const APP_ID = 'com.serversnap.app';
 app.setAppUserModelId(APP_ID);
@@ -495,17 +501,18 @@ async function deployInspect(serverId) {
   });
 }
 
-function deployJob(serverId, folder, mode, siteIds) {
+function deployJob(serverId, folder, mode, siteIds, opts = {}) {
   const server = store.get(serverId);
   if (!server) throw new Error('Server not found');
   if (serverBusy(serverId)) throw new Error('Something is already running on this server. Wait for it to finish.');
   const cfg = deploy.load(folder);
-  const what = { all: 'Deploy', docker: 'Docker start', sites: 'Websites + domains' }[mode] || 'Deploy';
+  const what = (opts.data ? 'Deploy with backup' : { all: 'Deploy', docker: 'Docker start', sites: 'Websites + domains' }[mode]) || 'Deploy';
   const job = newJob('deploy', serverId, `${what}: ${cfg.project} → ${server.name}`);
   const ev = (e) => jobEvent(job, e);
   (async () => {
     try {
-      const res = await runDeploy({ server, folder, mode, siteIds, connect: () => connectServer(serverId), signal: job.controller.signal, onEvent: ev });
+      const res = await runDeploy({ server, folder, mode, siteIds, connect: () => connectServer(serverId), signal: job.controller.signal, onEvent: ev,
+        full: !!opts.full, cleanup: opts.cleanup !== false, data: opts.data || null });
       for (const p of res.problems) ev({ type: 'log', level: 'warn', msg: `Needs a look: ${p}`, at: Date.now() });
       const links = deployLinks(serverId).map((d) => (path.resolve(d.folder) === path.resolve(folder) ? { ...d, last: { at: new Date().toISOString(), status: res.status, mode, urls: res.urls } } : d));
       store.patch(serverId, { deploys: links });
@@ -703,6 +710,273 @@ async function templateCreate(serverId, p) {
   return { folder: res.folder, files: res.files, changed: res.changed, notSaved: res.config && res.config.notSaved };
 }
 
+// ---------- server setup, watchdog, .env, change domain, database viewer (admin only) ----------
+// Steps from "@@STEP id|running|label": the first running text names the step.
+function labelledStep(ev) {
+  const labels = {};
+  return (id, _l, status, detail) => {
+    if (status === 'running' && !labels[id] && detail) labels[id] = detail;
+    ev({ type: 'item', item: { id, label: labels[id] || id, status, detail: status === 'running' && labels[id] === detail ? '' : detail || '' } });
+  };
+}
+
+function scriptJob(serverId, type, title, script, { prefix, okText } = {}) {
+  const server = store.get(serverId);
+  if (!server) throw new Error('Server not found');
+  if (serverBusy(serverId)) throw new Error('Something is already running on this server. Wait for it to finish.');
+  const job = newJob(type, serverId, title);
+  const ev = (e) => jobEvent(job, e);
+  const say = (msg, level = 'info') => ev({ type: 'log', level, msg, at: Date.now() });
+  (async () => {
+    let remote = null;
+    try {
+      remote = await connectServer(serverId);
+      if (remote.priv === 'none') throw new Error('This needs root (or sudo) on the server.');
+      const r = await runScript(remote, script, { say, step: labelledStep(ev), signal: job.controller.signal, stepPrefix: prefix || type });
+      if (r.fail) throw new Error(r.fail);
+      const partial = r.warnings.length || (r.done && !/^(ok|ready)$/.test(r.done));
+      if (okText && !partial) say(okText);
+      finishJob(job, partial ? 'partial' : 'done', { status: partial ? 'partial' : 'ok', error: partial ? r.warnings.join(' ') : null });
+    } catch (err) {
+      log(err);
+      say(err.message, 'error');
+      finishJob(job, err.code === 'ABORTED' ? 'stopped' : 'failed', { status: 'failed', error: err.message });
+    } finally {
+      if (remote) remote.close();
+      dropLive(serverId);
+      send('servers-changed');
+    }
+  })();
+  return publicJob(job);
+}
+
+async function setupCheck(serverId) {
+  const fx = smokeFixture('setup');
+  if (fx) return fx;
+  return withLive(serverId, async (r) => {
+    if (r.priv === 'none') throw new Error('This login has no root rights on the server.');
+    return serverSetup.parseCheck(await r.run(serverSetup.checkScript(), { root: true, timeoutMs: 60000 }));
+  });
+}
+
+function setupJob(serverId, opts) {
+  const script = serverSetup.setupScript(opts || {});
+  log(`setup on ${store.get(serverId).name}: ${(opts.parts || []).join(', ')}`);
+  return scriptJob(serverId, 'setup', `Set up ${store.get(serverId).name}`, script, { okText: '✅ The server is ready for deploys.' });
+}
+
+// Websites the watchdog can check, from the linked project folders.
+function watchdogSuggestions(serverId) {
+  const sites = [];
+  const projects = [];
+  for (const l of deployLinks(serverId)) {
+    let cfg;
+    try { cfg = deploy.load(l.folder); } catch (_) { continue; }
+    if (cfg.docker) projects.push(cfg.project);
+    for (const s of cfg.sites || []) {
+      if (!s.enabled) continue;
+      const base = `${s.ssl ? 'https' : 'http'}://${s.domain}`;
+      if (s.kind === 'trading' && s.backendPort) sites.push({ url: `${base}/api/`, port: s.backendPort, project: cfg.project });
+      else if (s.kind === 'proxy' && s.port) sites.push({ url: `${base}/`, port: s.port, project: cfg.project });
+    }
+  }
+  return { sites, projects: [...new Set(projects)] };
+}
+
+async function watchdogStatus(serverId) {
+  const fx = smokeFixture('watchdog');
+  if (fx) return fx;
+  const st = await withLive(serverId, async (r) => {
+    if (r.priv === 'none') throw new Error('This login has no root rights on the server.');
+    return watchdog.parseStatus(await r.run(watchdog.statusScript(), { root: true, timeoutMs: 30000 }));
+  });
+  return { ...st, suggest: watchdogSuggestions(serverId) };
+}
+
+async function watchdogSave(serverId, cfg) {
+  const out = await withLive(serverId, (r) => r.run(cfg ? watchdog.installScript(cfg) : watchdog.removeScript(), { root: true, timeoutMs: 60000 }));
+  log(`watchdog on ${store.get(serverId).name}: ${String(out).trim()}`);
+  return watchdogStatus(serverId);
+}
+
+// .env files of a linked project, on the server
+function envProject(folder) {
+  const cfg = deploy.load(folder);
+  if (!cfg.docker) throw new Error('This project does not run with Docker on the server.');
+  return cfg;
+}
+
+async function envList(serverId, folder) {
+  const cfg = envProject(folder);
+  const fx = smokeFixture('env');
+  if (fx) return fx.list;
+  const list = await withLive(serverId, async (r) => envEdit.parseList(await r.run(envEdit.listScript(cfg.remoteDir), { root: true, timeoutMs: 30000 })));
+  if (!list) throw new Error(`${cfg.remoteDir} is not on the server yet. Deploy the project first.`);
+  return list;
+}
+
+async function envRead(serverId, folder, rel) {
+  const cfg = envProject(folder);
+  envEdit.checkRel(rel);
+  const fx = smokeFixture('env');
+  const text = fx ? fx.text : Buffer.from((await withLive(serverId, (r) => r.run(envEdit.readCommand(cfg.remoteDir, rel), { root: true, timeoutMs: 30000 }))).trim(), 'base64').toString('utf8');
+  const compose = deploy.readCompose(folder) || { services: [] };
+  let composeText = '';
+  try { composeText = fs.readFileSync(path.join(folder, compose.file || 'docker-compose.yml'), 'utf8'); } catch (_) { /* none */ }
+  const localFile = path.join(folder, ...rel.split('/'));
+  const localText = fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8') : null;
+  return {
+    rel, entries: envEdit.entries(text), affected: envEdit.affected(compose, composeText, rel),
+    services: (compose.services || []).map((s) => s.name),
+    local: localText == null ? 'missing' : localText.replace(/\r\n/g, '\n') === text.replace(/\r\n/g, '\n') ? 'same' : 'different',
+  };
+}
+
+async function envSave(serverId, folder, rel, rows, opts = {}) {
+  const cfg = envProject(folder);
+  envEdit.checkRel(rel);
+  const stamp = stampNow();
+  // start from the file as it is now on the server, so nothing typed elsewhere is lost
+  const current = Buffer.from((await withLive(serverId, (r) => r.run(envEdit.readCommand(cfg.remoteDir, rel), { root: true, timeoutMs: 30000 }))).trim(), 'base64').toString('utf8');
+  const text = envEdit.rebuild(current, rows);
+  if (text === current && !opts.apply) return { changed: false };
+  await withLive(serverId, (r) => r.run(envEdit.writeScript(cfg.remoteDir, rel, text, stamp), { root: true, timeoutMs: 30000 }));
+  log(`env: ${rel} of ${cfg.project} saved on ${store.get(serverId).name}`);
+  // the same file on this PC, so the next deploy does not bring the old values back
+  if (opts.alsoLocal) {
+    const localFile = path.join(folder, ...rel.split('/'));
+    if (fs.existsSync(localFile)) {
+      const keep = path.join(folder, domainChange.BACKUP_DIR, `env-${stamp}`, ...rel.split('/'));
+      fs.mkdirSync(path.dirname(keep), { recursive: true });
+      fs.copyFileSync(localFile, keep);
+    }
+    fs.mkdirSync(path.dirname(localFile), { recursive: true });
+    fs.writeFileSync(localFile, text);
+  }
+  let job = null;
+  const svc = (opts.apply && opts.apply.services) || [];
+  if (svc.length) {
+    const script = envEdit.applyScript(cfg, svc, !!opts.apply.rebuild);
+    if (script) job = scriptJob(serverId, 'env', `${opts.apply.rebuild ? 'Rebuild' : 'Restart'} ${svc.join(', ')} (${rel} changed)`, script, { prefix: 'env', okText: `✅ ${svc.join(', ')} now use the new ${rel}.` });
+  }
+  return { changed: true, job };
+}
+
+// Change domain: what would change (nothing is written yet)
+async function domainPlan(serverId, folder, map, newMain) {
+  const cfg = deploy.load(folder);
+  const pairs = domainChange.pairsFor(cfg.sites.filter((s) => s.enabled), map || {}, cfg.mainDomain, String(newMain || '').trim().toLowerCase());
+  for (const p of pairs) if (!deploy.isDomain(p.to)) throw new Error(`"${p.to}" is not a domain name.`);
+  const files = pairs.length ? await domainChange.findUsages(folder, cfg, pairs) : [];
+  return { pairs, files, docker: cfg.docker };
+}
+
+function domainJob(serverId, folder, input) {
+  const server = store.get(serverId);
+  if (serverBusy(serverId)) throw new Error('Something is already running on this server. Wait for it to finish.');
+  const cfg = deploy.load(folder);
+  const newMain = String(input.newMain || '').trim().toLowerCase();
+  const enabled = cfg.sites.filter((s) => s.enabled && input.map[s.id] && input.map[s.id] !== s.domain);
+  if (!enabled.length) throw new Error('Type at least one new domain.');
+  const pairs = domainChange.pairsFor(cfg.sites.filter((s) => s.enabled), input.map, cfg.mainDomain, newMain);
+  const job = newJob('domain', serverId, `Change domain: ${cfg.project} → ${newMain || enabled[0].domain}`);
+  const ev = (e) => jobEvent(job, e);
+  const say = (msg, level = 'info') => ev({ type: 'log', level, msg, at: Date.now() });
+  const step = (id, label, status, detail) => ev({ type: 'item', item: { id, label, status, detail: detail || '' } });
+  (async () => {
+    try {
+      // 1. the new domains must point here before anything changes
+      step('dns', 'New domains point to the server', 'running');
+      const bad = [];
+      for (const s of enabled) {
+        if (s.skipDnsCheck) continue;
+        const r = await dnsCheck(input.map[s.id], server.host);
+        if (!r.ok) bad.push(dnsMessage(input.map[s.id], r));
+      }
+      if (bad.length) { step('dns', 'New domains point to the server', 'failed'); throw new Error(`Nothing was changed. ${bad.join(' ')}`); }
+      step('dns', 'New domains point to the server', 'ok');
+      // 2. the project folder on this PC
+      const stamp = stampNow();
+      step('files', 'Put the new domain in the project files', 'running');
+      const changed = await domainChange.applyFiles(folder, input.files || [], pairs, stamp);
+      deploy.save(folder, domainChange.newConfig(cfg, input.map, newMain));
+      step('files', 'Put the new domain in the project files', 'ok', `${changed} file${changed === 1 ? '' : 's'} · old copies in ${domainChange.BACKUP_DIR}\\domain-${stamp}`);
+      // 3. a normal deploy with the new domains (the backend too when its files changed)
+      const siteFolders = cfg.sites.map((s) => s.folder);
+      const backendChanged = (input.files || []).some((rel) => !siteFolders.some((d) => rel === d || rel.startsWith(d + '/')));
+      const mode = cfg.docker && backendChanged ? 'all' : 'sites';
+      say(mode === 'all' ? 'Files outside the websites changed too, so the containers are rebuilt as well.' : 'Only the websites change.');
+      const res = await runDeploy({ server, folder, mode, siteIds: mode === 'sites' ? enabled.map((s) => s.id) : null, connect: () => connectServer(serverId), signal: job.controller.signal, onEvent: ev });
+      for (const p of res.problems) say(`Needs a look: ${p}`, 'warn');
+      // 4. the old domains send visitors to the new ones
+      if (input.redirect !== false) {
+        const remote = await connectServer(serverId);
+        try {
+          for (const s of enabled) {
+            const to = input.map[s.id];
+            if (!res.urls.some((u) => u.includes(to))) { say(`${s.domain}: no redirect, because ${to} did not go live.`, 'warn'); continue; }
+            const r = await runScript(remote, domainChange.redirectScript(cfg.project, s.domain, to, { www: s.www, stamp }), {
+              say, step: (id, _l, st, d) => step(`redirect:${s.id}`, `${s.domain} → ${to} (redirect)`, st, st === 'running' ? '' : d), signal: job.controller.signal, stepPrefix: 'rd',
+            });
+            if (r.fail) say(`${s.domain}: ${r.fail}`, 'warn');
+          }
+        } finally { remote.close(); }
+      }
+      const links = deployLinks(serverId).map((d) => (path.resolve(d.folder) === path.resolve(folder) ? { ...d, last: { at: new Date().toISOString(), status: res.status, mode, urls: res.urls } } : d));
+      store.patch(serverId, { deploys: links });
+      finishJob(job, res.status === 'ok' ? 'done' : res.status === 'partial' ? 'partial' : 'failed', { status: res.status, urls: res.urls, error: res.status === 'failed' ? res.problems.join(' ') : null });
+    } catch (err) {
+      log(err);
+      say(err.message, 'error');
+      finishJob(job, err.code === 'ABORTED' ? 'stopped' : 'failed', { status: 'failed', error: err.message });
+    } finally {
+      dropLive(serverId);
+      send('servers-changed');
+    }
+  })();
+  return publicJob(job);
+}
+
+// Database viewer: running MongoDB containers only
+async function dbContainers(serverId) {
+  const fx = smokeFixture('dbview');
+  if (fx) return fx.containers;
+  const view = await dockerView(serverId, false);
+  return view.groups.flatMap((g) => g.containers).filter((c) => c.dbKind).map((c) => ({
+    id: c.id, name: c.name, project: c.project, service: c.service, image: c.image, kind: c.dbKind, running: c.running,
+  }));
+}
+
+const DB_WRITES = new Set(['replace', 'insert', 'deleteMany', 'deleteFilter', 'setField', 'empty', 'drop', 'dropDatabase']);
+async function dbCall(serverId, containerId, dbName, action, args = {}) {
+  if (!Object.prototype.hasOwnProperty.call(dbview.JS, action)) throw new Error('Unknown action');
+  const fx = smokeFixture('dbview');
+  if (fx) return fx[action] || null;
+  if (!/^[0-9a-f]{12,64}$/.test(String(containerId))) throw new Error('Not a container id');
+  const list = await dbContainers(serverId);
+  const c = list.find((x) => x.id === containerId || x.id.startsWith(containerId));
+  if (!c || c.kind !== 'mongo') throw new Error('That MongoDB container is no longer on the server.');
+  if (!c.running) throw new Error(`${c.name} is stopped. Start it in the Docker tab first.`);
+  dbview.checkName(dbName || 'admin', 'database');
+  if (args.coll != null) dbview.checkName(args.coll, 'collection');
+  if (action === 'find' || action === 'exportAll' || action === 'deleteFilter') args = { ...args, filter: dbview.buildFilter(args.search || {}) };
+  if (action === 'deleteFilter' && !Object.keys(args.filter).length) throw new Error('Search first: "Delete these results" needs a search.');
+  if (action === 'find') args.limit = Math.min(200, Math.max(1, Number(args.limit) || 20));
+  if (DB_WRITES.has(action)) log(`db ${action} on ${store.get(serverId).name}/${c.name}/${dbName}${args.coll ? '.' + args.coll : ''}`);
+  const { cmd, stdin } = dbview.command(c.id, dbName || 'admin', dbview.JS[action], args);
+  const r = await withLive(serverId, (x) => x.exec(cmd, { root: true, stdin, timeoutMs: action === 'exportAll' ? 10 * 60 * 1000 : 120000 }));
+  return dbview.parse(r);
+}
+
+async function dbExport(serverId, containerId, dbName, coll, search, format) {
+  const docs = await dbCall(serverId, containerId, dbName, 'exportAll', { coll, search });
+  const ext = format === 'json' ? 'json' : 'csv';
+  const r = await dialog.showSaveDialog(win, { title: `Save ${coll}`, defaultPath: path.join(app.getPath('documents'), `${dbName}-${coll}.${ext}`), filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
+  if (r.canceled || !r.filePath) return null;
+  await fs.promises.writeFile(r.filePath, ext === 'json' ? JSON.stringify(docs, null, 2) : dbview.toCsv(docs));
+  return { file: r.filePath, count: docs.length };
+}
+
 // ---------- scheduler ----------
 function tick() {
   for (const s of store.data.servers) {
@@ -814,7 +1088,13 @@ function registerIpc() {
   });
   handle('settings:testTelegram', () => notify.telegram(store.telegram(), '✅ ServerSnap is connected. Backup alerts will come here.'));
   handle('dialog:folder', async (title) => {
+    const fx = smokeFixture('dialog');
+    if (fx && /backup folder/i.test(title || '')) return fx.folder;
     const r = await dialog.showOpenDialog(win, { title: title || 'Choose a folder', properties: ['openDirectory', 'createDirectory'] });
+    return r.canceled ? null : r.filePaths[0];
+  });
+  handle('dialog:file', async (title, filters) => {
+    const r = await dialog.showOpenDialog(win, { title: title || 'Choose a file', properties: ['openFile'], filters: filters || undefined });
     return r.canceled ? null : r.filePaths[0];
   });
   handle('dialog:keyFile', async () => {
@@ -845,22 +1125,26 @@ function registerIpc() {
     const all = fresh.groups.flatMap((g) => g.containers);
     let list;
     let project = null;
+    let leftovers = []; // volumes of a deleted customer that nothing uses any more
     if (target && target.project) {
       const g = fresh.groups.find((x) => x.name === target.project);
       if (!g) throw new Error(`Project "${target.project}" is no longer on the server. Press Refresh.`);
       list = g.containers;
       project = g.name;
+      leftovers = g.volumes.filter((v) => !v.usedBy.length && v.name).map((v) => v.name);
     } else {
       const want = new Set((target && target.containers) || []);
       list = all.filter((c) => want.has(c.id));
     }
-    if (!list.length) throw new Error('Those containers are no longer on the server. Press Refresh.');
-    const volumes = withVolumes ? docker.volumesOnlyUsedBy(list, all) : [];
+    const volumes = withVolumes ? [...new Set([...docker.volumesOnlyUsedBy(list, all), ...leftovers])] : [];
+    if (!list.length && !volumes.length) {
+      throw new Error(leftovers.length ? 'Its containers are already gone; only its data is left. Tick "Also delete their data" to remove it.' : 'Those containers are no longer on the server. Press Refresh.');
+    }
     log(`docker DELETE on ${store.get(id).name}: ${list.map((c) => c.name).join(', ')}${volumes.length ? ` + volumes ${volumes.join(', ')}` : ''}`);
     const failed = [];
     await withLive(id, async (r) => {
       const root = r.priv !== 'none';
-      await r.run(docker.removeContainersCommand(list, { project }), { root, timeoutMs: 5 * 60 * 1000 });
+      if (list.length) await r.run(docker.removeContainersCommand(list, { project }), { root, timeoutMs: 5 * 60 * 1000 });
       for (const v of volumes) {
         const res = await r.exec(docker.removeVolumeCommand(v), { root, timeoutMs: 120000 });
         if (res.code !== 0) failed.push({ name: v, error: (res.stderr || '').trim().split('\n').pop() });
@@ -912,7 +1196,12 @@ function registerIpc() {
   handle('deploy:inspect', (id) => deployInspect(id));
   handle('deploy:save', (id, folder, cfg) => { const saved = deploy.save(folder, cfg); linkDeploy(id, folder); send('servers-changed'); return saved; });
   handle('deploy:unlink', (id, folder) => { store.patch(id, { deploys: deployLinks(id).filter((d) => path.resolve(d.folder) !== path.resolve(folder)) }); return true; });
-  handle('deploy:run', (id, folder, mode, siteIds) => deployJob(id, folder, mode, siteIds || null));
+  handle('deploy:run', (id, folder, mode, siteIds, opts) => deployJob(id, folder, mode, siteIds || null, opts || {}));
+  handle('deploy:dataInspect', async (folder, source) => {
+    const compose = deploy.readCompose(folder);
+    if (!compose) throw new Error('This project has no docker-compose.yml, so there is no database to load a backup into.');
+    return { ...(await deployData.inspectSource(source)), services: deployData.dbServices(compose), dbName: deployData.projectDbName(folder) };
+  });
   handle('deploy:rollback', (id, folder, siteId) => rollbackJob(id, folder, siteId));
   handle('deploy:sites', (id) => withLive(id, async (r) => deploy.parseSites(await r.run(deploy.sitesListScript(), { root: true, timeoutMs: 60000 }))));
   handle('deploy:openFolder', (folder) => shell.openPath(folder));
@@ -925,6 +1214,18 @@ function registerIpc() {
   handle('doctor:fix', (id, fix) => doctorFix(id, fix));
   handle('template:plan', (id, input) => templatePlan(id, input));
   handle('template:create', (id, p) => templateCreate(id, p));
+  handle('setup:check', (id) => setupCheck(id));
+  handle('setup:run', (id, opts) => setupJob(id, opts));
+  handle('watchdog:status', (id) => watchdogStatus(id));
+  handle('watchdog:save', (id, cfg) => watchdogSave(id, cfg || null));
+  handle('env:list', (id, folder) => envList(id, folder));
+  handle('env:read', (id, folder, rel) => envRead(id, folder, rel));
+  handle('env:save', (id, folder, rel, rows, opts) => envSave(id, folder, rel, rows, opts || {}));
+  handle('domain:plan', (id, folder, map, newMain) => domainPlan(id, folder, map, newMain));
+  handle('domain:run', (id, folder, input) => domainJob(id, folder, input));
+  handle('db:containers', (id) => dbContainers(id));
+  handle('db:call', (id, containerId, dbName, action, args) => dbCall(id, containerId, dbName, action, args || {}));
+  handle('db:export', (id, containerId, dbName, coll, search, format) => dbExport(id, containerId, dbName, coll, search, format));
   handle('clients:choices', (id, project) => clientChoices(id, project));
   handle('clients:save', (id, input) => clientJob(id, input));
   handle('clients:run', (id, clientId) => clientRunJob(id, clientId));

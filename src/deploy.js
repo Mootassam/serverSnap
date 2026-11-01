@@ -12,7 +12,7 @@ const { KINDS, TRADING_WS, FWD_PROTO, fillTemplate } = require('./nginx-template
 
 const CONFIG_FILE = 'snap.json';
 const STATE_DIR = '/root/serversnap-deploy';
-const DEFAULT_EXCLUDE = ['node_modules', '.git', '.claude', '.vscode', '.idea'];
+const DEFAULT_EXCLUDE = ['node_modules', '.git', '.claude', '.vscode', '.idea', '.serversnap-backup', 'docker-compose.yml.before-serversnap'];
 const BACKEND_NAMES = ['server', 'backend', 'api'];
 
 // ---------- validation ----------
@@ -552,7 +552,7 @@ function markerParser(onMarker, onLine) {
 }
 
 module.exports = {
-  CONFIG_FILE, STATE_DIR, DEFAULT_EXCLUDE,
+  CONFIG_FILE, STATE_DIR, DEFAULT_EXCLUDE, preamble,
   detect, normalize, validate, save, load, readCompose, websiteFolders, defaultDomain, baseDomain, projectNameFrom,
   isDomain, isPort, isRemoteDir, isRootDir, isProjectName,
   inspectScript, parseInspect, serverProjects, portConflicts, upScript,

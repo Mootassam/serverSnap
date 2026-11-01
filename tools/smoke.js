@@ -147,6 +147,61 @@ steps.push(
   ['24-template', `go({name:'server', id:'srv-1', tab:'deploy'}); api.call('deploy:list','srv-1').then((l) => { templateModal(state.servers[0], l); setTimeout(() => { document.querySelector('.modal .row .btn').click(); const d = document.querySelector('.modal input'); d.value = 'newclient.com'; d.dispatchEvent(new Event('input')); }, 200); }); 0;`],
   ['25-template-preview', "document.querySelector('.modal-foot .btn.primary').click(); 0;"],
 );
+// Deploy tools: a backup to load, server setup, auto-repair, .env, database viewer
+const zlib = require('zlib');
+const bson = (o) => {
+  const parts = [];
+  for (const [k, v] of Object.entries(o)) { const b = Buffer.from(v + '\0'); const l = Buffer.alloc(4); l.writeInt32LE(b.length); parts.push(Buffer.from([2]), Buffer.from(k + '\0'), l, b); }
+  const body = Buffer.concat([...parts, Buffer.from([0])]);
+  const l = Buffer.alloc(4); l.writeInt32LE(body.length + 4);
+  return Buffer.concat([l, body]);
+};
+const magic = Buffer.alloc(4); magic.writeUInt32LE(0x8199e26d);
+const term = Buffer.alloc(4); term.writeInt32LE(-1);
+const archive = Buffer.concat([magic, bson({ version: '0.1' }), ...['users', 'deposits', 'withdraws', 'tradeorders', 'wallets', 'settings'].map((c) => bson({ db: 'trade', collection: c, metadata: '{}' })), term]);
+const cbk = path.join(dir, 'customer-backup');
+fs.mkdirSync(path.join(cbk, 'databases'), { recursive: true });
+fs.mkdirSync(path.join(cbk, 'volumes'), { recursive: true });
+fs.writeFileSync(path.join(cbk, 'databases', 'milan-db-1.archive.gz'), zlib.gzipSync(archive));
+fs.writeFileSync(path.join(cbk, 'volumes', 'milan_upload.tar.gz'), zlib.gzipSync(Buffer.alloc(2048)));
+fs.writeFileSync(path.join(cbk, 'manifest.json'), JSON.stringify({ finishedAt: '2026-10-30T22:10:00Z', items: [
+  { id: 'db:docker:milan-db-1', type: 'database', kind: 'mongo', container: 'milan-db-1', service: 'db', label: 'Database (MongoDB)', file: 'databases/milan-db-1.archive.gz', status: 'ok' },
+  { id: 'volume:milan_upload', type: 'volume', name: 'milan_upload', label: 'Files: upload', file: 'volumes/milan_upload.tar.gz', status: 'ok' }] }));
+fs.writeFileSync(path.join(dir, 'dialog.json'), JSON.stringify({ folder: cbk }));
+fs.writeFileSync(path.join(dir, 'setup.json'), JSON.stringify({ os: 'Ubuntu 24.04.1 LTS', apt: '1', git: 'git version 2.43.0', docker: '-', compose: '-', nginx: '-', certbot: '-', node: '-',
+  swap: 0, mem: 1990000, disk: 23400000, ufw: 'inactive', fail2ban: '-', updates: 'installed', tz: 'Etc/UTC', sshport: '22' }));
+const minsAgo = (n) => new Date(Date.now() - n * 60e3).toISOString().replace('T', ' ').slice(0, 19);
+fs.writeFileSync(path.join(dir, 'watchdog.json'), JSON.stringify({ on: true,
+  config: { projects: [], sites: [{ url: 'https://milan-trade.com/api/', port: 8083 }], containers: true, nginx: true, disk: true },
+  events: [{ at: minsAgo(42), kind: 'fixed', text: 'milan-backend-1 crashed (exit code 1) -> start' }, { at: minsAgo(190), kind: 'back', text: 'milan-trade.com answers 200 again' },
+    { at: minsAgo(193), kind: 'fixed', text: 'milan-trade.com answered 502 3 times -> restarted milan-backend-1' }, { at: minsAgo(1500), kind: 'fixed', text: 'disk was 91% full -> cleaned, now 74%' }],
+  suggest: { sites: [{ url: 'https://milan-trade.com/api/', port: 8083, project: 'milan' }, { url: 'https://pc.milan-trade.com/api/', port: 8083, project: 'milan' }], projects: ['milan'] } }));
+fs.writeFileSync(path.join(dir, 'env.json'), JSON.stringify({
+  list: [{ rel: '.env', size: 182, mtime: new Date(Date.now() - 86400e3 * 3).toISOString() }, { rel: 'server/.env', size: 640, mtime: new Date(Date.now() - 7200e3).toISOString() }],
+  text: '# Database\nDATABASE_CONNECTION=mongodb://db:27017/grap\nREDIS_HOST=redis\nREDIS_PASSWORD=Zq7xPp2LmW9kT4vB\nAUTH_JWT_SECRET=h8Gd2kLq9ZxWv3Nm\n\n# App\nPORT=8083\nFRONTEND_URL=https://milan-trade.com\nTELEGRAM_BOT=8123456789:AAH-example\n',
+}));
+const oid = (n) => ({ $oid: '6721f0c0ffee00000000' + String(n).padStart(4, '0') });
+const users = ['ravi.kumar@gmail.com', 'priya.s@yahoo.in', 'amit.trader@gmail.com', 'neha99@outlook.com', 'vikram.m@gmail.com', 'sana.k@gmail.com', 'rahul.v@hotmail.com']
+  .map((email, i) => ({ _id: oid(i + 1), email, phone: '98' + String(76543210 + i * 1111), username: email.split('@')[0], balance: [1520.5, 89, 23040, 0, 410, 7800, 55][i],
+    vip: i % 3 === 0 ? 'gold' : 'basic', createdAt: { $date: new Date(Date.now() - (i + 1) * 86400e3 * 3).toISOString() } }));
+fs.writeFileSync(path.join(dir, 'dbview.json'), JSON.stringify({
+  containers: [{ id: 'c0ffee000000000000000000000000000000000000000000000000000000beef', name: 'milan-db-1', project: 'milan', service: 'db', image: 'mongo:4.0-xenial', kind: 'mongo', running: true },
+    { id: 'c0ffee000000000000000000000000000000000000000000000000000000cafe', name: 'king-db-1', project: 'king', service: 'db', image: 'mongo:4.0-xenial', kind: 'mongo', running: true }],
+  databases: [{ name: 'admin', size: 40960 }, { name: 'grap', size: 9.6e6 }, { name: 'local', size: 73728 }],
+  collections: [['auditlogs', 2210], ['deposits', 318], ['notifications', 940], ['settings', 1], ['tradeorders', 5120], ['transactions', 1204], ['users', 7], ['wallets', 7], ['withdraws', 96]].map(([name, count]) => ({ name, count, size: count * 420 })),
+  find: { docs: users, total: users.length, more: false, keys: ['_id', 'email', 'phone', 'username', 'balance', 'vip', 'createdAt', '__v'] },
+}));
+steps.push(
+  ['26-deploy-tools', "closeModal(); go({name:'server', id:'srv-1', tab:'deploy'});"],
+  ['27-deploy-backup', "api.call('deploy:list','srv-1').then((l) => { startDeploy(state.servers[0], l[0], 'all'); setTimeout(() => document.querySelector('.section .btn.small').click(), 300); }); 0;"],
+  ['28-setup', 'closeModal(); setupModal(state.servers[0]); 0;'],
+  ['29-watchdog', 'closeModal(); watchdogModal(state.servers[0]); 0;'],
+  ['30-env', "closeModal(); api.call('deploy:list','srv-1').then((l) => envModal(state.servers[0], l[0])); 0;"],
+  ['31-domain', "closeModal(); api.call('deploy:list','srv-1').then((l) => { domainModal(state.servers[0], l[0]); setTimeout(() => { const i = document.querySelector('.modal .field input'); i.value = 'milan-trade.co'; i.dispatchEvent(new Event('input')); }, 200); }); 0;"],
+  ['32-db', "closeModal(); go({name:'server', id:'srv-1', tab:'db'});"],
+  ['33-db-doc', "document.querySelector('.db-table tr.click td:nth-child(3)').click();"],
+  ['34-delete-leftovers', "closeModal(); go({name:'server', id:'srv-1', tab:'docker'}); setTimeout(() => { const g = { name: 'jack', title: 'jack', workingDir: null, containers: [], volumes: ['phone', 'redis_data', 'upload'].map((n, i) => ({ name: 'jack_' + n, role: 'data', usedBy: [], sizeKb: [325000, 3700, 4][i] })), imageIds: [] }; deleteContainersModal(g, [], true); const t = document.querySelector('.modal .field input'); t.value = 'Jack'; t.dispatchEvent(new Event('input')); }, 600);"],
+);
 fs.writeFileSync(path.join(dir, 'steps.json'), JSON.stringify(steps));
 
 // The customer app, with one website and two backups waiting.

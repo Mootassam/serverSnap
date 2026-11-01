@@ -79,9 +79,9 @@ async function renderServer(main, id) {
       h('button', { class: 'btn primary', disabled: s.running, onclick: () => startBackup(s.id) }, s.running ? 'Running…' : 'Back up now')),
     last && last.status === 'failed' && last.error ? h('div', { class: 'note bad' }, `Last backup failed: ${last.error}`) : null,
     h('div', { class: 'tabs' },
-      ...[['what', 'What to back up'], ['docker', 'Docker'], ['deploy', `Deploy${(s.deploys || []).length ? ` (${s.deploys.length})` : ''}`], ['security', 'Security'], ['doctor', 'Site Doctor'], ['clients', `Customers${(s.clients || []).length ? ` (${s.clients.length})` : ''}`], ['schedule', 'Schedule & storage']]
+      ...[['what', 'What to back up'], ['docker', 'Docker'], ['db', 'Database'], ['deploy', `Deploy${(s.deploys || []).length ? ` (${s.deploys.length})` : ''}`], ['security', 'Security'], ['doctor', 'Site Doctor'], ['clients', `Customers${(s.clients || []).length ? ` (${s.clients.length})` : ''}`], ['schedule', 'Schedule & storage']]
         .map(([k, label]) => h('a', { class: tab === k ? 'active' : '', onclick: () => { state.page.tab = k; render(); } }, label))),
-    tab === 'what' ? whatTab(s, scan) : tab === 'docker' ? dockerTab(s) : tab === 'deploy' ? deployTab(s) : tab === 'security' ? securityTab(s) : tab === 'doctor' ? doctorTab(s) : tab === 'clients' ? clientsTab(s) : scheduleTab(s));
+    tab === 'what' ? whatTab(s, scan) : tab === 'docker' ? dockerTab(s) : tab === 'db' ? dbTab(s) : tab === 'deploy' ? deployTab(s) : tab === 'security' ? securityTab(s) : tab === 'doctor' ? doctorTab(s) : tab === 'clients' ? clientsTab(s) : scheduleTab(s));
 }
 
 function whatTab(s, scan) {
@@ -463,15 +463,17 @@ async function deleteThings(channel, ids, what) {
 function deleteContainersModal(g, list, whole) {
   const d = state.docker;
   const names = new Set(list.map((c) => c.name));
-  const dataVols = g.volumes.filter((v) => v.usedBy.length && v.usedBy.every((u) => names.has(u)));
+  // its data: volumes only these containers use, and (whole customer) volumes nothing uses any more
+  const dataVols = g.volumes.filter((v) => (v.usedBy.length && v.usedBy.every((u) => names.has(u))) || (whole && !v.usedBy.length && v.name));
+  const onlyData = whole && !list.length;
   const s = state.servers.find((x) => x.id === d.serverId) || {};
   const client = whole && (s.clients || []).find((c) => c.project === g.name);
   const running = list.filter((c) => c.running).length;
-  const withData = h('input', { type: 'checkbox' });
+  const withData = h('input', { type: 'checkbox', checked: onlyData, disabled: onlyData });
   const typed = h('input', { type: 'text', placeholder: g.name || '' });
   const okBtn = h('button', { class: 'btn primary danger-fill', disabled: whole }, whole ? `Delete ${g.name}` : `Delete ${list.length} container(s)`);
   const sync = () => {
-    okBtn.disabled = whole && typed.value.trim() !== g.name;
+    okBtn.disabled = whole && typed.value.trim().toLowerCase() !== String(g.name).toLowerCase();
     okBtn.textContent = (whole ? `Delete ${g.name}` : `Delete ${list.length} container(s)`) + (withData.checked ? ' + data' : '');
   };
   typed.addEventListener('input', sync);
@@ -487,9 +489,9 @@ function deleteContainersModal(g, list, whole) {
       const res = await api.call('docker:removeContainers', d.serverId, target, alsoData);
       d.data = res.view;
       for (const c of list) d.pick.containers.delete(c.id);
-      const extra = alsoData ? ` and ${res.volumes} volume(s)` : '';
-      if (res.failed.length) toast(`Deleted ${res.removed} container(s)${extra}. Not deleted: ${res.failed.map((x) => `${x.name} (${x.error})`).join('; ')}`, true);
-      else toast(`Deleted ${res.removed} container(s)${extra}.`);
+      const done = [res.removed ? `${res.removed} container(s)` : null, alsoData ? `${res.volumes} volume(s)` : null].filter(Boolean).join(' and ') || 'nothing';
+      if (res.failed.length) toast(`Deleted ${done}. Not deleted: ${res.failed.map((x) => `${x.name} (${x.error})`).join('; ')}`, true);
+      else toast(`Deleted ${done}.`);
     } catch (err) {
       toast(err.message, true);
     } finally {
@@ -499,13 +501,14 @@ function deleteContainersModal(g, list, whole) {
   });
   openModal(
     h('h1', {}, whole ? `Delete customer "${g.name}"?` : `Delete ${list.length === 1 ? list[0].name : `${list.length} containers`}?`),
-    h('div', { class: 'card' }, h('h2', {}, `Containers to delete (${list.length})`),
-      list.map((c) => h('div', { class: 'small', style: 'padding:2px 0' }, h('b', {}, c.name), h('span', { class: 'muted' }, ` · ${c.image} · ${c.state}`)))),
+    onlyData ? h('div', { class: 'note' }, `${g.name} has no containers any more. Only its data is left on the server: ${dataVols.length} volume(s), ${fmtKb(dataVols.reduce((n, v) => n + (v.sizeKb || 0), 0))}.`)
+      : h('div', { class: 'card' }, h('h2', {}, `Containers to delete (${list.length})`),
+        list.map((c) => h('div', { class: 'small', style: 'padding:2px 0' }, h('b', {}, c.name), h('span', { class: 'muted' }, ` · ${c.image} · ${c.state}`)))),
     running ? h('div', { class: 'note' }, `${running} of them are running and will be stopped. If this is a live website, it goes offline.`) : null,
     dataVols.length ? h('label', { class: 'check' }, withData, h('div', { class: 't' },
       h('b', {}, 'Also delete their data (cannot be undone)'),
       h('div', { class: 'muted small' }, dataVols.map((v) => `${v.role === 'anonymous' ? 'unnamed volume' : v.name}${v.sizeKb != null ? ` (${fmtKb(v.sizeKb)})` : ''}`).join(', ')),
-      h('div', { class: 'muted small' }, 'Leave this unticked to keep the database and uploads: starting the project again brings everything back.'))) : null,
+      onlyData ? null : h('div', { class: 'muted small' }, 'Leave this unticked to keep the database and uploads: starting the project again brings everything back.'))) : null,
     h('div', { class: 'note info' },
       g.workingDir && whole ? `The project folder ${g.workingDir} (docker-compose.yml, .env, code) is not deleted. ` : '',
       'Not sure? Close this and press "Back up now" first.',
@@ -703,6 +706,7 @@ function deployTab(s) {
           h('div', { class: 'muted small' }, 'Pick a project folder on this PC. One click uploads it, starts it with Docker Compose, puts its websites on their domains (nginx + HTTPS), checks that they answer, and puts the old version back by itself if something fails.')),
         h('button', { class: 'btn', onclick: () => templateModal(s, list) }, 'New client from a template'),
         h('button', { class: 'btn primary', onclick: () => deployModal(s) }, '+ Add a project folder'))),
+      serverToolsCard(s),
       list.length ? list.map((d) => deployCard(s, d)) : h('div', { class: 'card empty' }, h('h1', {}, 'No projects yet'),
         h('p', {}, 'Press "+ Add a project folder" and choose a folder like D:\\Milan. ServerSnap reads its docker-compose.yml and website folders and suggests everything.')),
       serverSitesCard(s));
@@ -752,25 +756,135 @@ function deployCard(s, d) {
           d.saved ? h('button', { class: 'btn small', onclick: () => startDeploy(s, d, 'sites', [x.id]) }, 'Deploy this one') : null,
           d.saved ? h('button', { class: 'btn small', onclick: () => rollbackSite(s, d, x) }, 'Roll back') : null)))) :
       h('div', { class: 'muted small', style: 'margin-top:8px' }, 'No website switched on (Docker only).'),
-    h('details', {}, h('summary', {}, 'More'),
-      h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: () => api.call('deploy:openFolder', d.folder) }, 'Open folder'), remove)));
+    h('div', { class: 'card-tools' },
+      d.saved && sites.length ? h('button', { class: 'btn small', onclick: () => domainModal(s, d) }, 'Change domain') : null,
+      d.saved && c.docker ? h('button', { class: 'btn small', onclick: () => envModal(s, d) }, 'Settings (.env)') : null,
+      h('button', { class: 'btn small ghost', onclick: () => api.call('deploy:openFolder', d.folder) }, 'Open folder'),
+      h('span', { class: 'grow-1' }),
+      remove));
 }
 
 async function startDeploy(s, d, mode, siteIds) {
   const c = d.config;
   const sites = c.sites.filter((x) => x.enabled && (!siteIds || siteIds.includes(x.id)));
+  const docker = mode !== 'sites' && c.docker;
   const lines = [];
-  if (mode !== 'sites' && c.docker) lines.push(`Upload ${c.project} to ${c.remoteDir} and run "docker compose up -d --build".`);
+  if (docker) lines.push(`Send ${c.project} to ${c.remoteDir} and run "docker compose up -d --build".`);
   if (mode !== 'docker') for (const x of sites) lines.push(`${x.domain}: ${x.kind === 'proxy' ? `send to container port ${x.port}` : x.build === 'build' ? `build ${x.folder}, copy it to the server` : `copy ${x.folder}/dist to the server`}, ${KIND_SHORT[x.kind]} nginx file${x.ssl ? ', HTTPS' : ''}.`);
+
+  const full = h('input', { type: 'checkbox' });
+  const cleanup = h('input', { type: 'checkbox', checked: true });
+  const data = { picked: null, rows: [] };
+  const dataBox = h('div', {});
+  const err = h('div', { class: 'note bad hidden' });
+  const goBtn = h('button', { class: 'btn primary' }, 'Deploy');
+
+  const drawData = () => {
+    if (!data.picked) {
+      fill(dataBox, h('div', { class: 'muted small' }, 'Optional. Your customer sent you their data? It goes into the database before the backend starts, so the site opens with it.'),
+        h('div', { class: 'row', style: 'margin-top:10px' },
+          h('button', { class: 'btn small', onclick: () => pickData('folder') }, 'Choose a backup folder…'),
+          h('button', { class: 'btn small', onclick: () => pickData('file') }, 'Choose a file…')),
+        h('div', { class: 'muted small', style: 'margin-top:8px' }, 'Reads ServerSnap and Client backups, MongoDB dumps (.archive, .gz or a dump folder), .sql / .sql.gz, and .zip / .tar.gz of uploaded files.'));
+      goBtn.textContent = 'Deploy';
+      return;
+    }
+    const p = data.picked;
+    fill(dataBox,
+      h('div', { class: 'row' }, h('div', { class: 'grow-1' }, h('b', {}, p.source.split(/[\\/]/).pop()),
+        h('span', { class: 'pill' }, { serversnap: 'ServerSnap backup', mongo: 'MongoDB dump', sql: 'SQL dump', files: 'Files' }[p.kind]),
+        p.made ? h('span', { class: 'muted small' }, `  made ${fmtDate(p.made)}`) : null),
+      h('button', { class: 'btn small ghost', onclick: () => { data.picked = null; data.rows = []; drawData(); } }, 'Remove')),
+      data.rows.map((r) => r.el),
+      data.rows.some((r) => r.item.type === 'database')
+        ? h('div', { class: 'note' }, 'The database is replaced by the backup. ServerSnap first saves a safety copy of what is in it now, and puts it back by itself if loading fails.') : null);
+    goBtn.textContent = 'Deploy with this backup';
+  };
+
+  const dataRow = (p, item) => {
+    const on = h('input', { type: 'checkbox', checked: true });
+    const body = h('div', { class: 'data-opts' });
+    const size = item.bytes != null ? fmtBytes(item.bytes) : '';
+    let read;
+    if (item.type === 'database') {
+      const match = p.services.filter((x) => x.kind === item.kind);
+      const svc = h('select', {}, match.length ? match.map((x) => h('option', { value: x.name }, x.name)) : h('option', { value: '' }, 'no matching database in docker-compose.yml'));
+      const names = item.dbs ? Object.keys(item.dbs).filter((n) => !['admin', 'local', 'config'].includes(n)) : [];
+      const from = h('input', { type: 'text', value: names.length === 1 ? names[0] : '', placeholder: 'name in the backup' });
+      const to = h('input', { type: 'text', value: names.length === 1 && p.dbName ? p.dbName : '', placeholder: p.dbName || 'name the project uses' });
+      const sameName = names.length === 1 && p.dbName && names[0] === p.dbName;
+      fill(body,
+        names.length ? h('div', { class: 'muted small' }, names.map((n) => `${n}: ${item.dbs[n].length} collection${item.dbs[n].length === 1 ? '' : 's'}`).join(' · ')) : null,
+        h('div', { class: 'grid2', style: 'grid-template-columns: 1fr 1fr 1fr; margin-top:8px' },
+          h('label', { class: 'field' }, 'Load into', svc),
+          item.kind === 'mongo' ? h('label', { class: 'field' }, 'Database in the backup', from) : null,
+          item.kind === 'mongo' ? h('label', { class: 'field' }, sameName ? 'Same name in the project' : 'Rename it to', to) : null));
+      read = () => {
+        const f = from.value.trim(); const t = to.value.trim();
+        return { ...item, service: svc.value, renameFrom: f && t && f !== t ? f : null, renameTo: f && t && f !== t ? t : null };
+      };
+    } else {
+      const guess = String(item.from || '').split(/[\\/_]/).filter(Boolean).pop() || 'uploads';
+      const kind = h('select', {}, h('option', { value: 'folder' }, 'A folder in the project'), h('option', { value: 'volume', selected: p.kind === 'serversnap' && /^volume:/.test(item.id) }, 'A Docker volume'));
+      const where = h('input', { type: 'text', value: guess.replace(/^.*?_/, '') || 'uploads', placeholder: 'uploads' });
+      const hint = h('div', { class: 'muted small', style: 'margin-top:4px' });
+      const whereLabel = h('span', {});
+      const sync = () => { whereLabel.textContent = kind.value === 'volume' ? 'Volume name' : 'Folder in the project'; hint.textContent = kind.value === 'folder' ? `Goes into ${c.remoteDir}/${where.value || '…'} on the server (files with the same name are replaced).` : `Goes into the volume ${c.project}_${where.value || '…'} (made if missing).`; };
+      kind.addEventListener('change', sync); where.addEventListener('input', sync); sync();
+      fill(body, h('div', { class: 'grid2', style: 'margin-top:8px' }, h('label', { class: 'field' }, 'Put the files into', kind), h('label', { class: 'field' }, whereLabel, where)), hint);
+      read = () => ({ ...item, target: kind.value === 'folder' ? { type: 'folder', path: where.value.trim().replace(/^\/+|\/+$/g, '') } : { type: 'volume', name: where.value.trim() } });
+    }
+    on.addEventListener('change', () => body.classList.toggle('hidden', !on.checked));
+    const el = h('div', { class: 'data-item' },
+      h('label', { class: 'check', style: 'border:none;padding:0' }, on, h('div', { class: 't' }, h('b', {}, item.label), size ? h('span', { class: 'muted small' }, `  ${size}`) : null)),
+      body);
+    return { el, item, on, read };
+  };
+
+  const pickData = async (how) => {
+    const src = how === 'folder'
+      ? await safe(() => api.call('dialog:folder', 'Choose the backup folder (ServerSnap backup or MongoDB dump folder)'))
+      : await safe(() => api.call('dialog:file', 'Choose the backup file', [{ name: 'Backups', extensions: ['gz', 'archive', 'sql', 'zip', 'tgz', 'tar', 'bson', 'dump'] }, { name: 'All files', extensions: ['*'] }]));
+    if (!src) return;
+    fill(dataBox, h('div', { class: 'muted small' }, 'Reading the backup…'), h('div', { class: 'bar indeterminate' }, h('i')));
+    const p = await safe(() => api.call('deploy:dataInspect', d.folder, src));
+    if (!p) { data.picked = null; drawData(); return; }
+    data.picked = p;
+    data.rows = p.items.map((it) => dataRow(p, it));
+    drawData();
+  };
+
   const ok = await new Promise((resolve) => {
     const done = (v) => { closeModal(); resolve(v); };
+    goBtn.addEventListener('click', () => {
+      err.classList.add('hidden');
+      let opts = { full: full.checked, cleanup: cleanup.checked };
+      if (data.picked) {
+        const items = data.rows.filter((r) => r.on.checked).map((r) => r.read());
+        if (!items.length) { err.textContent = 'Tick at least one part of the backup, or remove it.'; err.classList.remove('hidden'); return; }
+        const noDb = items.find((i) => i.type === 'database' && !i.service);
+        if (noDb) { err.textContent = `${noDb.label}: there is no matching database container in docker-compose.yml.`; err.classList.remove('hidden'); return; }
+        opts = { ...opts, data: { items } };
+      }
+      done(opts);
+    });
     openModal(h('h1', {}, `Deploy ${c.project} to ${s.name}?`),
-      h('ul', {}, lines.map((l) => h('li', {}, l))),
-      h('div', { class: 'note info' }, 'Every step is checked. If nginx or the website check fails, the old setup is put back by itself.'),
-      h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: () => done(false) }, 'Cancel'), h('button', { class: 'btn primary', onclick: () => done(true) }, 'Deploy')));
+      h('ul', { class: 'plan' }, lines.map((l) => h('li', {}, l))),
+      h('div', { class: 'note info' }, 'First the websites are built and the server is checked (disk space, ports, domains). Nothing on the server changes until every check passes. If nginx or the website check fails, the old setup is put back by itself.'),
+      h('div', { class: 'section' }, h('h2', {}, 'Options'),
+        h('label', { class: 'check' }, full, h('div', { class: 't' }, h('b', {}, 'Send every file again'),
+          h('div', { class: 'muted small' }, 'Normally only the files that changed since the copy on the server are sent. Tick this if someone changed files on the server by hand.'))),
+        docker ? h('label', { class: 'check' }, cleanup, h('div', { class: 't' }, h('b', {}, 'Clean up old Docker images afterwards'),
+          h('div', { class: 'muted small' }, 'Only after every container started fine. The previous version is kept, older leftovers are deleted so the disk does not fill up.'))) : null),
+      docker ? h('div', { class: 'section' }, h('h2', {}, 'Load a backup'), dataBox) : null,
+      err,
+      h('div', { class: 'modal-foot' }, h('button', { class: 'btn', onclick: () => done(null) }, 'Cancel'), goBtn));
+    $('#modalCard').classList.add('wide');
+    drawData();
   });
   if (!ok) return;
-  const j = await safe(() => api.call('deploy:run', s.id, d.folder, mode, siteIds || null));
+  if (ok.data && !(await confirmBox('Replace the data on the server?', `The database${ok.data.items.filter((i) => i.type === 'database').length > 1 ? 's' : ''} of ${c.project} on ${s.name} will hold the backup's data. A safety copy of the current data is made first.`, 'Yes, deploy with the backup', true))) return;
+  const j = await safe(() => api.call('deploy:run', s.id, d.folder, mode, siteIds || null, ok));
   if (j) { state.jobs.set(j.id, j); go({ name: 'activity' }); }
 }
 

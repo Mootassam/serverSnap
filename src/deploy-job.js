@@ -1,16 +1,14 @@
 'use strict';
 // Runs a deploy for the Activity page: one step per part, live server output in the log.
 //   mode: 'all' (Docker + websites) | 'docker' | 'sites'
-const fs = require('fs');
 const path = require('path');
 const deploy = require('./deploy');
 const local = require('./deploy-local');
 const { KINDS } = require('./nginx-templates');
-const { q } = require('./shell');
+const sync = require('./deploy-sync');
+const dataLoad = require('./deploy-data');
 
 const LONG = 60 * 60 * 1000;
-// A server path as a shell word (SNAP_ROOT is empty on real servers; tests set it).
-const rp = (p) => '"${SNAP_ROOT:-}"' + q(p);
 
 function stampNow() {
   const d = new Date();
@@ -36,24 +34,13 @@ async function runScript(remote, script, { say, step, signal, stepPrefix }) {
   return result;
 }
 
-async function upload(remote, dir, target, { exclude, say, step, id, label, signal }) {
-  step(id, label, 'running');
-  const file = await local.pack(dir, { exclude, signal, name: path.basename(dir) });
-  try {
-    const size = fs.statSync(file).size;
-    say(`Uploading ${label.toLowerCase()} (${(size / 1048576).toFixed(1)} MB)…`);
-    await remote.upload(target, file, { root: true, signal, onBytes: (b) => step(id, label, 'running', `${Math.round((b / size) * 100)}%`) });
-    step(id, label, 'ok', `${(size / 1048576).toFixed(1)} MB`);
-  } finally {
-    fs.rm(file, { force: true }, () => {});
-  }
-}
-
 /**
- * opts: { server (host…), folder, mode, siteIds?, connect(), signal, onEvent }
+ * opts: { server (host…), folder, mode, siteIds?, connect(), signal, onEvent,
+ *         full (send every file), cleanup (old images, default on), data (a backup to load, see deploy-data.js) }
  * Returns { status: 'ok' | 'partial' | 'failed', urls: [], problems: [] }
+ * Order: build on this PC → checks (nothing on the server is changed until they pass) → Docker → websites.
  */
-async function runDeploy({ server, folder, mode = 'all', siteIds = null, connect, signal, onEvent }) {
+async function runDeploy({ server, folder, mode = 'all', siteIds = null, connect, signal, onEvent, full = false, cleanup = true, data = null }) {
   const say = (msg, level = 'info') => onEvent({ type: 'log', level, msg, at: Date.now() });
   const labels = {};
   const step = (id, label, status, detail) => {
@@ -70,6 +57,33 @@ async function runDeploy({ server, folder, mode = 'all', siteIds = null, connect
   const doDocker = mode !== 'sites' && cfg.docker;
   const sites = mode === 'docker' ? [] : cfg.sites.filter((s) => s.enabled && (!siteIds || siteIds.includes(s.id)));
   if (!doDocker && !sites.length) throw new Error(mode === 'docker' ? 'This project does not use Docker (see Edit).' : 'No website is switched on for this project (see Edit).');
+  if (data && !doDocker) throw new Error('Loading a backup needs the Docker part of the deploy (Deploy everything or Docker only).');
+  const compose = doDocker ? deploy.readCompose(folder) : null;
+  if (doDocker && !compose) throw new Error('docker-compose.yml is missing in the project folder.');
+  if (data) dataLoad.validate(data, compose);
+
+  // ---------- 1. build the websites on this PC (a broken build stops here, before the server) ----------
+  const dists = {};
+  for (const site of sites) {
+    if (!KINDS[site.kind].static) continue;
+    const dir = path.join(folder, site.folder);
+    if (site.build === 'build') {
+      const id = `site:${site.id}:build`;
+      step(id, `${site.domain}: build ${site.folder} on this PC`, 'running');
+      try {
+        dists[site.id] = await local.buildSite(dir, { signal, onLine: (l) => say(`[${site.folder}] ${l}`) });
+      } catch (err) {
+        if (err.code === 'ABORTED') throw err;
+        step(id, null, 'failed');
+        throw new Error(`${site.folder}: the build failed, so nothing was changed on the server. ${err.message}`);
+      }
+      if (!dists[site.id]) { step(id, null, 'failed'); throw new Error(`${site.folder}: the build finished but there is no dist/index.html. Nothing was changed on the server.`); }
+      step(id, null, 'ok');
+    } else {
+      dists[site.id] = local.distOf(dir);
+      if (!dists[site.id]) throw new Error(`${site.folder} has no dist/index.html. Choose "Build it now" for this website in Edit.`);
+    }
+  }
 
   step('connect', 'Connect to the server', 'running');
   const remote = await connect();
@@ -79,75 +93,95 @@ async function runDeploy({ server, folder, mode = 'all', siteIds = null, connect
     step('connect', null, 'ok', server.host);
     say(`Logs on the server: ${deploy.STATE_DIR}/logs/${cfg.project}-${stamp}.log`);
 
-    // ---------- Docker ----------
+    // ---------- 2. checks: everything that would make the deploy stop halfway ----------
+    step('checks', 'Checks before deploy (disk, ports, domains)', 'running');
+    const fails = [];
     if (doDocker) {
-      if (!insp.tools.docker) throw new Error('Docker is not installed on the server. Install it first (curl -fsSL https://get.docker.com | sh).');
-      if (!insp.tools.compose) throw new Error('Docker Compose is not installed on the server.');
-      const compose = deploy.readCompose(folder);
-      if (!compose) throw new Error('docker-compose.yml is missing in the project folder.');
+      if (!insp.tools.docker) fails.push('Docker is not installed on the server. Press "Set up server" on the Deploy tab.');
+      else if (!insp.tools.compose) fails.push('Docker Compose is not installed on the server. Press "Set up server" on the Deploy tab.');
       const conflicts = deploy.portConflicts(compose, cfg.project, insp);
       if (conflicts.length) {
-        throw new Error('These ports are already used on the server: ' +
-          conflicts.map((c) => `${c.port} (${c.service}) by ${c.by}`).join('; ') +
+        fails.push('These ports are already used on the server: ' + conflicts.map((c) => `${c.port} (${c.service}) by ${c.by}`).join('; ') +
           '. Change the port in docker-compose.yml (the left number in "8082:8082"), then deploy again.');
       }
+    }
+    const disk = sync.judgeChecks(sync.parseChecks(await remote.run(sync.checksScript(doDocker ? cfg.remoteDir : null), { root: true, timeoutMs: 30000 })), { needDocker: doDocker });
+    fails.push(...disk.fails);
+    for (const w of disk.warns) { problems.push(w); say(w, 'warn'); }
+    const dnsInfo = {};
+    for (const site of sites) {
+      const info = { wwwOk: site.www, ws: site.kind === 'trading' && site.ws ? `ws.${deploy.baseDomain(site.domain)}` : '' };
+      dnsInfo[site.id] = info;
+      if (site.skipDnsCheck) continue;
+      const r = await local.dnsCheck(site.domain, server.host);
+      if (!r.ok) { fails.push(local.dnsMessage(site.domain, r)); continue; }
+      if (site.www) {
+        info.wwwOk = (await local.dnsCheck(`www.${site.domain}`, server.host)).ok;
+        if (!info.wwwOk) say(`www.${site.domain} does not point to the server: the HTTPS certificate is made for ${site.domain} only.`, 'warn');
+      }
+      if (info.ws && !(await local.dnsCheck(info.ws, server.host)).ok) {
+        say(`${info.ws} (live prices) does not point to the server, so it is skipped. Add an A record ${info.ws} → ${server.host} and deploy again.`, 'warn');
+        info.ws = '';
+      }
+    }
+    if (fails.length) {
+      step('checks', null, 'failed', `${fails.length} problem${fails.length === 1 ? '' : 's'}`);
+      for (const f of fails) say(f, 'error');
+      throw new Error(`Stopped before changing anything on the server. ${fails.join(' ')}`);
+    }
+    step('checks', null, 'ok', disk.warns.length ? 'with warnings' : 'all good');
+
+    // ---------- 3. Docker ----------
+    if (doDocker) {
       const same = deploy.serverProjects(insp).find((p) => p.name === cfg.project);
       if (same && same.workingDir && same.workingDir !== cfg.remoteDir) {
         say(`Note: project ${cfg.project} is already running from ${same.workingDir} on the server, but this deploy uses ${cfg.remoteDir}.`, 'warn');
       }
       // website folders that are uploaded as dist anyway do not need to go up with the project
       const skip = cfg.sites.filter((s) => s.enabled && s.kind !== 'proxy' && !(compose.services || []).some((x) => x.build && x.build.replace(/^\.\//, '').replace(/\/$/, '') === s.folder)).map((s) => `./${s.folder}`);
-      await upload(remote, folder, `mkdir -p ${rp(cfg.remoteDir)} && tar -xzf - -C ${rp(cfg.remoteDir)} --no-same-owner`,
-        { exclude: [...(cfg.exclude || deploy.DEFAULT_EXCLUDE), ...skip], say, step, id: 'upload', label: 'Upload the project', signal });
+      step('upload', full ? 'Upload the project (every file)' : 'Upload the project (only what changed)', 'running');
+      const up = await sync.syncDir(remote, folder, cfg.remoteDir, {
+        exclude: [...(cfg.exclude || deploy.DEFAULT_EXCLUDE), ...skip], full, say, signal, name: cfg.project,
+        onBytes: (b, total) => step('upload', null, 'running', `${Math.round((b / total) * 100)}%`),
+      });
+      step('upload', null, 'ok', up.sent ? `${up.sent} file${up.sent === 1 ? '' : 's'} · ${(up.bytes / 1048576).toFixed(1)} MB` : 'nothing changed');
+      if (data) await dataLoad.loadData(remote, cfg, compose, data, { say, step, signal, stamp });
+      if (cleanup) await remote.exec(sync.keepPreviousScript(cfg.project), { root: true, timeoutMs: 60000, signal });
       step('up:docker', 'Build and start the containers (can take a few minutes)', 'running');
       const r = await runScript(remote, deploy.upScript(cfg, stamp), { say, step, signal, stepPrefix: 'up' });
       if (r.fail) { step('up:docker', null, 'failed', r.fail); throw new Error(r.fail); }
       if (r.warnings.length) { problems.push(...r.warnings); step('up:docker', null, 'warning', r.count ? `${r.count} running` : ''); }
+      // only after a good start: the previous images stay (tagged), older leftovers go
+      if (cleanup && !r.warnings.length) {
+        step('cleanup', 'Clean up old Docker images', 'running');
+        const c = await remote.exec(sync.cleanupScript(), { root: true, timeoutMs: 10 * 60 * 1000, signal });
+        const freed = sync.freedText(c.stdout);
+        step('cleanup', null, 'ok', freed ? `${freed} freed` : 'nothing to clean');
+      }
     }
 
-    // ---------- websites ----------
+    // ---------- 4. websites ----------
     for (const site of sites) {
       const sid = `site:${site.id}`;
       const L = (t) => `${site.domain}: ${t}`;
+      const { wwwOk, ws } = dnsInfo[site.id];
       try {
-        // 1. DNS
-        let wwwOk = site.www;
-        let ws = site.kind === 'trading' && site.ws ? `ws.${deploy.baseDomain(site.domain)}` : '';
-        if (!site.skipDnsCheck) {
-          step(`${sid}:dns`, L('domain points to the server'), 'running');
-          const r = await local.dnsCheck(site.domain, server.host);
-          if (!r.ok) { step(`${sid}:dns`, null, 'failed', r.ips.join(', ') || 'no record'); throw new Error(local.dnsMessage(site.domain, r)); }
-          step(`${sid}:dns`, null, 'ok', r.ips.join(', '));
-          if (site.www) {
-            wwwOk = (await local.dnsCheck(`www.${site.domain}`, server.host)).ok;
-            if (!wwwOk) say(`www.${site.domain} does not point to the server: the HTTPS certificate is made for ${site.domain} only.`, 'warn');
-          }
-          if (ws && !(await local.dnsCheck(ws, server.host)).ok) {
-            say(`${ws} (live prices) does not point to the server, so it is skipped. Add an A record ${ws} → ${server.host} and deploy again.`, 'warn');
-            ws = '';
-          }
-        }
-        // 2. where the website lives on the server (an existing setup keeps its folder)
+        // where the website lives on the server (an existing setup keeps its folder)
         let root = null;
         if (KINDS[site.kind].static) {
           const info = deploy.parseKv(await remote.run(deploy.siteInfoScript(site.domain), { root: true, timeoutMs: 30000 }));
           root = site.root || (info.root && deploy.isRootDir(info.root) ? info.root : null) || `/var/www/${site.domain}/html`;
           if (info.root && info.root !== root) say(`${site.domain} used ${info.root} before; it now uses ${root}.`, 'warn');
           else if (info.root) say(`${site.domain}: keeping its website folder ${root}`);
-          // 3. build on this PC
-          const dir = path.join(folder, site.folder);
-          let dist = local.distOf(dir);
-          if (site.build === 'build') {
-            step(`${sid}:build`, L(`build ${site.folder} on this PC`), 'running');
-            dist = await local.buildSite(dir, { signal, onLine: (l) => say(`[${site.folder}] ${l}`) });
-            if (!dist) throw new Error(`${site.folder}: the build finished but there is no dist/index.html.`);
-            step(`${sid}:build`, null, 'ok');
-          } else if (!dist) throw new Error(`${site.folder} has no dist/index.html. Choose "Build it now" for this website in Edit.`);
-          // 4. upload next to the live folder; the server script swaps it in
-          await upload(remote, dist, `rm -rf ${rp(root + '.new')} && mkdir -p ${rp(root + '.new')} && tar -xzf - -C ${rp(root + '.new')} --no-same-owner`,
-            { exclude: [], say, step, id: `${sid}:upload`, label: L('upload the website'), signal });
+          // next to the live folder, starting from a copy of it; the server script swaps it in
+          step(`${sid}:upload`, L(full ? 'upload the website (every file)' : 'upload the website (only what changed)'), 'running');
+          const up = await sync.syncDir(remote, dists[site.id], root + '.new', {
+            mirror: true, liveDir: root, full, say, signal, name: site.id,
+            onBytes: (b, total) => step(`${sid}:upload`, null, 'running', `${Math.round((b / total) * 100)}%`),
+          });
+          step(`${sid}:upload`, null, 'ok', up.sent || up.removed ? `${up.sent} new or changed, ${up.removed} removed · ${(up.bytes / 1048576).toFixed(1)} MB` : 'nothing changed');
         }
-        // 5. nginx + HTTPS + check (puts everything back by itself on failure)
+        // nginx + HTTPS + check (puts everything back by itself on failure)
         step(`${sid}:nginx`, L('nginx file'), 'running');
         step(`${sid}:ssl`, L('HTTPS'), site.ssl ? 'waiting' : 'skipped');
         step(`${sid}:check`, L('check the website answers'), 'waiting');
