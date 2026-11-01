@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { q } = require('./shell');
 const { parseCompose, parseEnv, exposedDatabases } = require('./compose');
-const { KINDS, TRADING_WS, FWD_PROTO, fillTemplate } = require('./nginx-templates');
+const { KINDS, TRADING_WS, FWD_PROTO, TUNING, fillTemplate } = require('./nginx-templates');
 
 const CONFIG_FILE = 'snap.json';
 const STATE_DIR = '/root/serversnap-deploy';
@@ -63,6 +63,38 @@ function backendService(compose) {
 }
 
 const hostPort = (svc) => (svc && svc.ports.find((p) => Number.isInteger(p.host)) || {}).host || null;
+
+// Compose services whose Dockerfile only copies a finished build (COPY ./build /usr/share/nginx/html).
+// They must be built on this PC before the upload, or the container gets the old build.
+// A Dockerfile that builds inside Docker (FROM ... AS ...) is left alone.
+function prebuiltServices(folder, compose) {
+  const out = [];
+  for (const s of (compose && compose.services) || []) {
+    if (!s.build) continue;
+    const name = path.posix.normalize(String(s.build).replace(/\\/g, '/')).replace(/^\.\//, '').replace(/\/$/, '');
+    const dir = path.join(folder, name);
+    let docker;
+    try { docker = fs.readFileSync(path.join(dir, 'Dockerfile'), 'utf8'); } catch (_) { continue; }
+    if (/^\s*FROM\s+\S+\s+AS\s+/im.test(docker)) continue;
+    const m = /^\s*COPY\s+(?:\.\/)?(build|dist)\/?\s+(\/\S*)\s*$/im.exec(docker);
+    const scripts = (readPackage(dir) || {}).scripts || {};
+    const script = scripts['build:production'] ? 'build:production' : scripts.build ? 'build' : null;
+    if (m && script) out.push({ service: s.name, folder: name, output: m[1], target: m[2].replace(/\/+$/, ''), script });
+  }
+  return out;
+}
+
+// Removes the old build on the server, so old files do not end up in the new image.
+function clearBuildScript(cfg, p) {
+  return `rm -rf "\${SNAP_ROOT:-}"${q(`${cfg.remoteDir}/${p.folder}/${p.output}`)}`;
+}
+
+// Prints the sha1 of the index.html the running container really serves.
+function servedBuildScript(cfg, p) {
+  return `cid=$(docker ps -q --filter ${q(`label=com.docker.compose.project=${cfg.project}`)} --filter ${q(`label=com.docker.compose.service=${p.service}`)} | head -n 1)
+[ -n "$cid" ] && docker exec "$cid" sha1sum ${q(`${p.target}/index.html`)} 2>/dev/null | cut -c1-40
+true`;
+}
 
 function readPackage(dir) {
   return readJson(path.join(dir, 'package.json'));
@@ -407,6 +439,11 @@ done
 # --- the nginx file ---
 echo ${q(b64(conf))} | base64 -d > "$AVAIL/$D"
 ln -sf "$AVAIL/$D" "$ENABLED/$D"
+# bigger server_names_hash so long domains don't fail "nginx -t"
+if ! grep -rEqs '^[[:space:]]*server_names_hash_bucket_size' "$R/etc/nginx/"; then
+  mkdir -p "$R/etc/nginx/conf.d"
+  echo ${q(b64(TUNING))} | base64 -d > "$R/etc/nginx/conf.d/serversnap-tuning.conf"
+fi
 ${site.kind === 'trading' ? `# $fwd_proto: exactly one definition for all sites
 if ! grep -rqs 'map $http_x_forwarded_proto $fwd_proto' "$R/etc/nginx/"; then
   mkdir -p "$R/etc/nginx/conf.d"
@@ -561,5 +598,6 @@ module.exports = {
   detect, normalize, validate, save, load, readCompose, websiteFolders, defaultDomain, baseDomain, projectNameFrom,
   isDomain, isPort, isRemoteDir, isRootDir, isProjectName,
   inspectScript, parseInspect, serverProjects, portConflicts, upScript,
+  prebuiltServices, clearBuildScript, servedBuildScript,
   siteInfoScript, parseKv, nginxFile, siteScript, rollbackScript, sitesListScript, parseSites, markerParser, namesFor,
 };

@@ -176,6 +176,12 @@ map $http_x_forwarded_proto $fwd_proto {
 }
 `;
 
+// Bigger hash slots so long domain names (e.g. www.platform.zalandostyle.com) do not fail
+// nginx -t with "could not build server_names_hash". Written once into conf.d.
+const TUNING = `# Made by ServerSnap: bigger slots so long domain names fit.
+server_names_hash_bucket_size 128;
+`;
+
 const NORMAL = HEADER + `server {
     listen 80;
     server_name __NAMES__;
@@ -321,4 +327,4 @@ function fillTemplate(body, vars) {
   return body.replace(/__([A-Z]+)__/g, (m, k) => (vars[k] != null ? String(vars[k]) : m));
 }
 
-module.exports = { KINDS, TRADING_WS, FWD_PROTO, fillTemplate, siteTemplate };
+module.exports = { KINDS, TRADING_WS, FWD_PROTO, TUNING, fillTemplate, siteTemplate };

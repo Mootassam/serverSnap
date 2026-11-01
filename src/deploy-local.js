@@ -13,9 +13,9 @@ function tarBin() {
   return process.platform === 'win32' && fs.existsSync(win) ? win : 'tar';
 }
 
-function run(cmd, args, { cwd, onLine, signal, shell = false } = {}) {
+function run(cmd, args, { cwd, onLine, signal, shell = false, env = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { cwd, shell, windowsHide: true, env: { ...process.env, CI: '1', FORCE_COLOR: '0' } });
+    const p = spawn(cmd, args, { cwd, shell, windowsHide: true, env: { ...process.env, CI: '1', FORCE_COLOR: '0', ...env } });
     let tail = '';
     const take = (d) => {
       const s = d.toString('utf8');
@@ -37,12 +37,13 @@ function run(cmd, args, { cwd, onLine, signal, shell = false } = {}) {
 }
 
 // npm run build in a website folder (npm install first when node_modules is missing).
-async function buildSite(dir, { onLine, signal } = {}) {
+// CI=false: with CI on, react-scripts stops the build on any lint warning.
+async function buildSite(dir, { onLine, signal, script = 'build' } = {}) {
   if (!fs.existsSync(path.join(dir, 'node_modules'))) {
     if (onLine) onLine('node_modules is missing: running npm install first (this can take a few minutes)…');
     await run('npm', ['install', '--no-audit', '--no-fund'], { cwd: dir, onLine, signal, shell: true });
   }
-  await run('npm', ['run', 'build'], { cwd: dir, onLine, signal, shell: true });
+  await run('npm', ['run', script], { cwd: dir, onLine, signal, shell: true, env: { CI: 'false' } });
   return distOf(dir);
 }
 

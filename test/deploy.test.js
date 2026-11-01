@@ -89,6 +89,25 @@ function makeProject() {
   return proj;
 }
 
+test('prebuilt: a Dockerfile copying ./build is built on the PC; one building in Docker is not', () => {
+  const proj = makeProject();
+  const w = (f, s) => fs.writeFileSync(path.join(proj, f), s);
+  const compose = { services: [{ name: 'web', build: './admin' }, { name: 'backend', build: './server' }] };
+  w('admin/Dockerfile', 'FROM nginx:alpine\nCOPY ./nginx.conf /etc/nginx/conf.d/default.conf\nCOPY ./build /usr/share/nginx/html\n');
+  w('server/Dockerfile', 'FROM node:18\nCOPY . /app/\n');
+  w('admin/package.json', JSON.stringify({ scripts: { build: 'react-scripts build', 'build:production': 'cross-env X=1 npm run build' } }));
+  assert.deepEqual(deploy.prebuiltServices(proj, compose), [
+    { service: 'web', folder: 'admin', output: 'build', target: '/usr/share/nginx/html', script: 'build:production' },
+  ]);
+  w('admin/package.json', JSON.stringify({ scripts: { build: 'vite build' } }));
+  assert.equal(deploy.prebuiltServices(proj, compose)[0].script, 'build');
+  w('admin/Dockerfile', 'FROM node:18 AS build\nRUN npm run build\nFROM nginx\nCOPY --from=build /app/build /usr/share/nginx/html\n');
+  assert.deepEqual(deploy.prebuiltServices(proj, compose), []);
+  const p = { service: 'web', folder: 'admin', output: 'build', target: '/usr/share/nginx/html' };
+  assert.match(deploy.clearBuildScript({ remoteDir: '/root/magical' }, p), /\/root\/magical\/admin\/build/);
+  assert.match(deploy.servedBuildScript({ project: 'magical' }, p), /com\.docker\.compose\.service=web/);
+});
+
 test('detect: suggests "site" (website + API) for backend sites, a port for the container site, admin off', () => {
   const proj = makeProject();
   const d = deploy.detect(proj);
@@ -239,7 +258,7 @@ exit 0
 function scratch() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'snaproot-')).replace(/\\/g, '/');
   for (const d of ['etc/nginx/sites-available', 'etc/nginx/sites-enabled', 'etc/nginx/conf.d', 'bin', 'var/www']) fs.mkdirSync(path.join(root, d), { recursive: true });
-  fs.writeFileSync(path.join(root, 'etc/nginx/nginx.conf'), 'http {\n  include /etc/nginx/conf.d/*.conf;\n  include /etc/nginx/sites-enabled/*;\n}\n');
+  fs.writeFileSync(path.join(root, 'etc/nginx/nginx.conf'), 'http {\n  # server_names_hash_bucket_size 64;\n  include /etc/nginx/conf.d/*.conf;\n  include /etc/nginx/sites-enabled/*;\n}\n');
   for (const [n, body] of Object.entries(FAKES)) fs.writeFileSync(path.join(root, 'bin', n), body, { mode: 0o755 });
   return root;
 }
@@ -276,6 +295,8 @@ test('site script: fresh trading website with www, live prices and HTTPS', { ski
   assert.ok(exists(root, 'etc/nginx/sites-enabled/milan.com'));
   assert.ok(exists(root, 'etc/nginx/sites-available/ws.milan.com'));
   assert.ok(exists(root, 'etc/nginx/conf.d/fwd_proto.conf'));
+  assert.ok(exists(root, 'etc/nginx/conf.d/serversnap-tuning.conf'), 'tuning file written');
+  assert.match(read(root, 'etc/nginx/conf.d/serversnap-tuning.conf'), /server_names_hash_bucket_size 128;/);
   assert.equal(read(root, `${webRoot}/index.html`), 'v1');
   assert.ok(!exists(root, `${webRoot}.new`));
   const calls = read(root, 'calls.log');

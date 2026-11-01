@@ -1,7 +1,9 @@
 'use strict';
 // Runs a deploy for the Activity page: one step per part, live server output in the log.
 //   mode: 'all' (Docker + websites) | 'docker' | 'sites'
+const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const deploy = require('./deploy');
 const local = require('./deploy-local');
 const { KINDS } = require('./nginx-templates');
@@ -85,6 +87,25 @@ async function runDeploy({ server, folder, mode = 'all', siteIds = null, connect
     }
   }
 
+  // ---------- containers that only copy a finished build (admin): build them here too ----------
+  const prebuilt = doDocker ? deploy.prebuiltServices(folder, compose) : [];
+  for (const p of prebuilt) {
+    const id = `prebuilt:${p.service}:build`;
+    const dir = path.join(folder, p.folder);
+    step(id, `${p.folder}: build on this PC (npm run ${p.script})`, 'running');
+    try {
+      await local.buildSite(dir, { signal, script: p.script, onLine: (l) => say(`[${p.folder}] ${l}`) });
+    } catch (err) {
+      if (err.code === 'ABORTED') throw err;
+      step(id, null, 'failed');
+      throw new Error(`${p.folder}: the build failed, so nothing was changed on the server. ${err.message}`);
+    }
+    const index = path.join(dir, p.output, 'index.html');
+    if (!fs.existsSync(index)) { step(id, null, 'failed'); throw new Error(`${p.folder}: the build finished but there is no ${p.output}/index.html. Nothing was changed on the server.`); }
+    p.sha1 = crypto.createHash('sha1').update(fs.readFileSync(index)).digest('hex');
+    step(id, null, 'ok');
+  }
+
   step('connect', 'Connect to the server', 'running');
   const remote = await connect();
   try {
@@ -139,6 +160,7 @@ async function runDeploy({ server, folder, mode = 'all', siteIds = null, connect
       }
       // website folders that are uploaded as dist anyway do not need to go up with the project
       const skip = cfg.sites.filter((s) => s.enabled && s.kind !== 'proxy' && !(compose.services || []).some((x) => x.build && x.build.replace(/^\.\//, '').replace(/\/$/, '') === s.folder)).map((s) => `./${s.folder}`);
+      for (const p of prebuilt) await remote.run(deploy.clearBuildScript(cfg, p), { root: true, timeoutMs: 60000, signal });
       step('upload', full ? 'Upload the project (every file)' : 'Upload the project (only what changed)', 'running');
       const up = await sync.syncDir(remote, folder, cfg.remoteDir, {
         exclude: [...(cfg.exclude || deploy.DEFAULT_EXCLUDE), ...skip], full, say, signal, name: cfg.project,
@@ -151,6 +173,17 @@ async function runDeploy({ server, folder, mode = 'all', siteIds = null, connect
       const r = await runScript(remote, deploy.upScript(cfg, stamp), { say, step, signal, stepPrefix: 'up' });
       if (r.fail) { step('up:docker', null, 'failed', r.fail); throw new Error(r.fail); }
       if (r.warnings.length) { problems.push(...r.warnings); step('up:docker', null, 'warning', r.count ? `${r.count} running` : ''); }
+      // proof: the running container serves the exact index.html just built on this PC
+      for (const p of prebuilt) {
+        const id = `prebuilt:${p.service}:check`;
+        step(id, `${p.folder}: check the container runs the new build`, 'running');
+        const served = String(await remote.run(deploy.servedBuildScript(cfg, p), { root: true, timeoutMs: 30000, signal })).trim();
+        if (served === p.sha1) step(id, null, 'ok');
+        else {
+          const msg = `${p.folder}: container "${p.service}" is NOT serving the new build${served ? '' : ' (could not read it)'}. Check it in the Docker tab.`;
+          problems.push(msg); say(msg, 'warn'); step(id, null, 'warning');
+        }
+      }
       // only after a good start: the previous images stay (tagged), older leftovers go
       if (cleanup && !r.warnings.length) {
         step('cleanup', 'Clean up old Docker images', 'running');

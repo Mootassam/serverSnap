@@ -1,7 +1,7 @@
 {
   "name": "serversnap",
   "productName": "ServerSnap",
-  "version": "1.6.0",
+  "version": "1.6.2",
   "description": "Back up a whole VPS (files, Docker volumes, databases) to your PC and restore it on any server.",
   "main": "main.js",
   "private": true,
